@@ -15,7 +15,7 @@
 Stage is a framework for building fault-tolerant systems within your tokio
 runtime. Designed to make self-healing tasks and actors as simple as
 possible respecting the cost-benefit tradeoff and allowing you the programmer
-to decide how much code you would like to modify for the benefits stage would
+to decide how much code they would like to modify for the benefits stage would
 provide you.
 
 ## Usage
@@ -124,7 +124,7 @@ The changes in this code are:
 - we've introduced a loop to retry our message since our task could panic but will restart, the sender half of the channel however will remain broken forever.
   - This means our future now has to not break the receiver half of the channel. This can be a non-issue for some cases where the channel abstraction is elsewhere i.e. zmq or a networking abstraction
 
-There is now a new issue in the second code. our task group will indefinitely spawn tasks to run potentially blocking the tokio runtime from shutting down.
+There is now a new potential issue in the code. the task group will indefinitely spawn tasks to run and may block the tokio runtime from shutting down.
 
 The solution is to scope your task block to the resolution of another future:
 
@@ -150,3 +150,5 @@ Now when our future finishes our group supervisor will abort and will no longer 
 
 
 ### Stage: The Third Degree
+
+[bastion]: https://docs.rs/bastion/

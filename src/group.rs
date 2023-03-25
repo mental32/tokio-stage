@@ -1,9 +1,14 @@
 use std::future::Future;
+use std::ops::Deref;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::stream::FuturesUnordered;
-use futures::StreamExt;
+use futures::TryFutureExt;
+
+use tokio::sync::{mpsc, oneshot, watch};
+use tracing::Span;
+
+use crate::supervisor::{Supervisor, SupervisorMessage, SupervisorStat};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestartPolicy {
@@ -11,7 +16,8 @@ pub enum RestartPolicy {
     UnlessAborted,
 }
 
-struct Config {
+pub(crate) struct Config {
+    pub span: Option<tracing::Span>,
     pub restart_policy: RestartPolicy,
     pub interval_dur: Duration,
     pub min_spawn: usize,
@@ -22,6 +28,7 @@ pub struct GroupBuilder(Config);
 impl Default for GroupBuilder {
     fn default() -> Self {
         Self(Config {
+            span: None,
             min_spawn: 1,
             restart_policy: RestartPolicy::UnlessAborted,
             interval_dur: Duration::from_millis(10),
@@ -45,15 +52,24 @@ impl GroupBuilder {
         self
     }
 
+    pub fn instrument(mut self, span: Span) -> Self {
+        self.0.span.replace(span);
+        self
+    }
+
     pub fn spawn<F, Fut>(self, f: F) -> Group
     where
         F: Send + Clone + Fn() -> Fut + 'static,
         Fut: Send + Future<Output = ()> + 'static,
     {
         let Self(config) = self;
+        let (sv_tx, rx) = mpsc::channel(1);
+        let (stat, sv_stat) = watch::channel(SupervisorStat::default());
 
         let sv_handle = tokio::spawn(async move {
             let sv = Supervisor {
+                stat,
+                chan_rx: rx,
                 make_fut: f,
                 config,
             };
@@ -62,74 +78,105 @@ impl GroupBuilder {
         });
 
         Group {
+            sv_tx,
+            sv_stat,
             sv_handle: Arc::new(sv_handle),
         }
     }
 }
 
+#[derive(Clone)]
 pub struct Group {
+    sv_tx: mpsc::Sender<SupervisorMessage>,
+    sv_stat: watch::Receiver<SupervisorStat>,
     sv_handle: Arc<tokio::task::JoinHandle<()>>,
 }
 
 impl Group {
+    fn sv_send(
+        &self,
+        message: SupervisorMessage,
+    ) -> impl Future<Output = Result<(), mpsc::error::SendError<()>>> + '_ {
+        self.sv_tx
+            .send(message)
+            .map_err(|_| mpsc::error::SendError(())) // erase the error data since SupervisorMessage is a private type.
+    }
+}
+
+impl Group {
+    /// View information and statistics about the supervisor of this group
+    ///
+    /// Use `stat_borrow_and_update` to access the stat structure and update
+    /// if a newer value was sent.
+    pub fn stat_borrow(&self) -> impl Deref<Target = SupervisorStat> + '_ {
+        self.sv_stat.borrow()
+    }
+
+    /// View information and statistics about the supervisor of this group
+    ///
+    /// This method will update the stat structure to the most recently sent
+    /// value sent by the supervisor task.
+    pub fn stat_borrow_and_update(&mut self) -> impl Deref<Target = SupervisorStat> + '_ {
+        self.sv_stat.borrow_and_update()
+    }
+
+    /// dynamically increase the number of running futures managed by the supervisor.
+    ///
+    /// Downscaling safely is not possible since futures do not have a native async_drop or
+    /// graceful shutdown trigger. If you want to downscale you must implement this capability
+    /// in your future directly.
+    pub fn upscale(
+        &self,
+        n: usize,
+    ) -> impl Future<Output = Result<(), mpsc::error::SendError<()>>> + '_ {
+        self.sv_send(SupervisorMessage::Upscale { n })
+    }
+
     /// Abort the group shutting down the supervisor.
     ///
     /// This will not shut down any tasks that have been spawned and are currently running.
     #[inline]
-    pub fn abort(self) {
+    pub fn abort_unchecked(self) {
         self.sv_handle.abort();
+    }
+
+    /// Signal the supervisor task to shut down and stop respawning tasks.
+    ///
+    /// The supervisor will hand over the [`tokio::task::JoinHandle`]s of the
+    /// tasks that are running. The caller is responsible for aborting, awaiting
+    /// or gracefully shutting down the spawned tasks.
+    pub fn shutdown(
+        &self,
+    ) -> impl Future<Output = Result<Vec<tokio::task::JoinHandle<()>>, mpsc::error::SendError<()>>>
+    {
+        let this = self.clone();
+        let (tx, rx) = oneshot::channel();
+
+        async move {
+            let () = this.sv_send(SupervisorMessage::Shutdown { tx }).await?;
+
+            let vec = rx
+                .unwrap_or_else(|_| {
+                    panic!("supervisor task dropped sender before submitting results")
+                })
+                .await;
+
+            Ok(vec)
+        }
     }
 
     /// Scope the lifetime of the supervisor to the future provided.
     ///
     /// When the future finishes the task group will be aborted.
-    /// See the documentation for [`abort`] for more details.
+    /// See the documentation for [`Self::abort_unchecked`] for more details.
     pub async fn scope<T, Fut>(self, future: Fut) -> T
     where
         Fut: Future<Output = T> + Send + 'static,
         Fut::Output: Send + 'static,
     {
         let t = future.await;
-        self.abort();
+        self.abort_unchecked();
         t
-    }
-}
-
-struct Supervisor<F> {
-    make_fut: F,
-    config: Config,
-}
-
-impl<F, Fut> Supervisor<F>
-where
-    F: 'static + Clone + Send + Fn() -> Fut,
-    Fut: 'static + Send + Future<Output = ()>,
-    Fut::Output: 'static + Send,
-{
-    fn into_future(self) -> impl Future<Output = ()> + 'static + Send {
-        tracing::trace!(n = ?self.config.min_spawn, "spawning inital minimum tasks");
-        let mut futs: FuturesUnordered<_> = (0..self.config.min_spawn)
-            .map(|_| tokio::spawn((self.make_fut)()))
-            .collect();
-
-        let mut interval = tokio::time::interval(self.config.interval_dur);
-
-        async move {
-            while let Some(task_result) = futs.next().await {
-                tracing::debug!(?task_result, "task exited");
-
-                if self.config.restart_policy == RestartPolicy::UnlessAborted
-                    && matches!(&task_result, Err(err) if err.is_cancelled())
-                {
-                    continue;
-                }
-
-                tracing::trace!("task failure, restarting with replica.");
-
-                futs.push(tokio::spawn((self.make_fut)()));
-                interval.tick().await;
-            }
-        }
     }
 }
 
@@ -140,6 +187,66 @@ mod test {
     use std::time::Duration;
 
     use tokio::sync::Mutex;
+
+    #[tokio::test]
+    async fn test_pos_upscale() {
+        let n = 10;
+        let delay = 100;
+
+        let ctr = Arc::new(AtomicUsize::new(0));
+        let ctr2 = Arc::clone(&ctr);
+
+        let group = crate::group().spawn_at_least(n).spawn({
+            move || {
+                let ctr = Arc::clone(&ctr2);
+
+                async move {
+                    ctr.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(delay + 1)).await;
+                }
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(delay / 10)).await;
+        assert_eq!(ctr.load(Ordering::SeqCst), n);
+
+        group.upscale(n * 2).await.expect("failed to upscale");
+
+        tokio::time::sleep(Duration::from_millis(delay / 10)).await;
+        assert_eq!(ctr.load(Ordering::SeqCst), n * 2);
+    }
+
+    #[tokio::test]
+    async fn test_pos_shutdown() {
+        async fn expect_min_spawn_n(n: usize, delay: u64) {
+            let ctr = Arc::new(AtomicUsize::new(0));
+            let ctr2 = Arc::clone(&ctr);
+
+            let group = crate::group().spawn_at_least(n).spawn({
+                move || {
+                    let ctr = Arc::clone(&ctr2);
+
+                    async move {
+                        ctr.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(delay + 1)).await;
+                    }
+                }
+            });
+
+            tokio::time::sleep(Duration::from_millis(delay / 10)).await;
+
+            let fut = group.shutdown();
+            let vec = tokio::time::timeout(Duration::from_millis(delay), fut)
+                .await
+                .expect("timeout")
+                .expect("shutdown failure");
+
+            assert_eq!(vec.len(), n);
+            assert_eq!(ctr.load(Ordering::SeqCst), n);
+        }
+
+        expect_min_spawn_n(100, 10).await;
+    }
 
     #[tokio::test]
     async fn test_pos_spawn_at_least_n() {
@@ -167,10 +274,10 @@ mod test {
             assert_eq!(ctr.load(Ordering::SeqCst), n);
         }
 
-        expect_min_spawn_n(5, 100).await;
-        expect_min_spawn_n(10, 100).await;
-        expect_min_spawn_n(100, 100).await;
-        expect_min_spawn_n(1000, 100).await;
+        expect_min_spawn_n(5, 10).await;
+        expect_min_spawn_n(10, 10).await;
+        expect_min_spawn_n(100, 10).await;
+        expect_min_spawn_n(1000, 10).await;
         expect_min_spawn_n(10000, 100).await;
         expect_min_spawn_n(100000, 300).await;
     }

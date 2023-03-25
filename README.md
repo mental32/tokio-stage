@@ -7,8 +7,14 @@
 - [Brief](#brief)
 - [Usage](#usage)
   - [Stage: The First Degree](#stage-the-first-degree)
+    - [Task Group (group)](#task-group-group)
   - [Stage: The Second Degree](#stage-the-second-degree)
+    - [Mailbox (reliable channel)](#mailbox-reliable-channel)
+      - [The Problem](#the-problem)
+      - [The Solution(s)](#the-solutions)
+    - [Supervision Tree's](#supervision-trees)
   - [Stage: The Third Degree](#stage-the-third-degree)
+- [bottom of the page](#bottom-of-the-page)
 
 ## Brief
 
@@ -35,13 +41,15 @@ new application from the ground up then consider the third.
 Stage when used in the first degree aims to replace the usage of `tokio::spawn`
 with a concept called "task group".
 
+#### Task Group (group)
+
 A Task Group (or group) is just a collection of tasks spawned to execute one type of
 future created from a function. They hold metadata like policy for the
 size of the group, when to not restart a task i.e. if it exited succesfully.
 
 Here is some code that spawns one actor task to process messages and respond.
 
-```rust,no_run
+```rust
 #[derive(Debug)]
 enum Message {
     Add(usize, usize, tokio::sync::oneshot::Sender<usize>)
@@ -78,7 +86,7 @@ You may find several issues with the code above
 
 Here is the same code using a stage group:
 
-```rust,no_run
+```rust
 use stage::prelude::*;
 
 use std::sync::Arc;
@@ -128,12 +136,19 @@ There is now a new potential issue in the code. the task group will indefinitely
 
 The solution is to scope your task block to the resolution of another future:
 
-```rust,no_compile,no_run
+```rust,no_run
+# let (tx, rx) = tokio::sync::mpsc::channel(1);
+# let group: stage::group::Group = unimplemented!();
+# #[derive(Debug)]
+# enum Message {
+#     Add(usize, usize, tokio::sync::oneshot::Sender<usize>)
+# }
+# async { 
 group
     .scope(async move {
         loop {
             let (ttx, trx) = tokio::sync::oneshot::channel();
-            tx.send(ttx).await.unwrap();
+            tx.send(Message::Add(1, 2, ttx)).await.unwrap();
 
             if let Ok(res) = trx.await {
                 assert_eq!(res, 3);
@@ -142,13 +157,209 @@ group
         }
     })
     .await;
+# };
 ```
 
 Now when our future finishes our group supervisor will abort and will no longer be restarting the tasks.
 
+Here are some more things you can do with a group:
+
+* upscale - dynamically upscale the amount of futures running and managed by the supervisor task
+* shutdown - gracefully shutdown the supervisor task and receive control of all the task joinhandles
+* stats - `stat_borrow(&self)` and `stat_borrow_and_update(&mut self)` allow you to inspect statistics published by the supervisor such as the amount of tasks running, the amount that have failed, the amount of iterations the supervisor loop has made processing tasks and messages.
+
 ### Stage: The Second Degree
 
+Stage used in the second degree focuses on actor control flow primitives, 
+unbreakable channels, and other patterns to suppliment the usage of task
+groups.
+
+#### Mailbox (reliable channel)
+
+Here we will introduce the `stage::mailbox` and explore what problem
+it solves and how to use it.
+
+##### The Problem
+
+In the last section when we replaced `tokio::spawn` with a task group we
+discovered an issue. the tokio mpsc channel will close the whole channel
+if either all sender halves are dropped or the one receiver half is dropped.
+
+This is an issue because if our future panics then the receiver will get
+dropped, closing the whole channel, rending the future owning a sender half
+as fragile an unreliable as the task inside the task group.
+
+Chances are the code was written with a "crash first" mentality so that
+the slightest issue will eventually lead to the container orchestrator to
+restart the process or you have decided to be more "resilliant" and ignore
+small issues that aren't fatal; opting to perhaps issue an alert to your
+monitoring infrastructure which leads to an operator manually restarting later.
+
+neither of these "solutions" are exactly ideal so what _could_ you do about
+this?
+
+1. wrap your receiver half in an `Arc` and `Mutex`. This makes the receiver
+   half almost undroppable, recloanable, and preserves a single reader property.
+
+2. link your task groups together so that you have a `one_for_all` supervisor
+   strategy. effectively hard rebooting your program inplace without the
+   process exiting.
+
+The second suggestion we will explore later with the concept of supervision
+tree's. At this moment you can try to do it yourself but you'll find that there
+is a non-trivial amount of boilerplate and logic needed to be embedded into your
+app.
+
+The first suggestion is what we did with the code in the last section, here
+it is so you can remind yourself:
+
+```rust
+use stage::prelude::*;
+
+use std::sync::Arc;
+use tokio::sync::Mutex;
+
+#[derive(Debug)]
+enum Message {
+    Add(usize, usize, tokio::sync::oneshot::Sender<usize>)
+}
+
+#[tokio::main]
+async fn main() {
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    let rx = Arc::new(Mutex::new(rx)); // <=== Here we make our receiver half "reliable"
+
+    let group = stage::group()
+        .spawn(move || {
+            let rx = Arc::clone(&rx);
+            async move {
+            while let Some(m) = rx.lock().await.recv().await {
+                let _ = match m {
+                    Message::Add(n, m, tx) => tx.send(n + m)
+                };
+            }
+        }}
+    );
+
+    group
+        .scope(async move {
+            loop { // <=== here we have to retry the operation until it succeedes
+                let (ttx, trx) = tokio::sync::oneshot::channel();
+                tx.send(Message::Add(1, 2, ttx)).await;
+
+                if let Ok(res) = trx.await {
+                    assert_eq!(res, 3);
+                    break;
+                }
+            }
+        })
+        .await;
+}
+```
+
+##### The Solution(s)
+
+Let's reiterate what we're trying to solve here:
+
+* premature closure - if the receiver gets dropped it shuts down the whole
+  channel affecting senders
+
+* message loss - if the task crashes after it's read a message but before it
+  could do work then this message is now lost. you'll need to decide if it's
+  worth it to track retransmitting messages to ensure the operation gets
+  completed.
+
+This is actually trivially solvable using existing technology today:
+
+1. journaling and transactions - Redis, or any database system; marshal your
+   messages into the store and then the worker will read and process where it
+   last had a checkpoint
+
+2. message brokering - ZeroMQ, ActiveMQ, Kafka; these will all provide reliable
+   messaging and answers message persistance
+
+The only downside of this is that you have resort to out-of-process message
+passing and every time you write to a queue or read a message from it you
+have to serialize and deserialize the contents to your type which has a
+non-zero cost.
+
+The third solution offered here is the mailbox. (`stage::mailbox`)
+
+A mailbox is just a queue (`std::collections::VecDeque`) managed by an actor.
+sending and receiving and modeled as pushing and popping data on the queue.
+This also allows you to preserve the bits of the data without serializing or
+deserializing it for writes and reads.
+
+Let's modify the code above to use a mailbox:
+
+```rust
+use stage::prelude::*;
+
+use std::sync::Arc;
+use tokio::sync::Mutex;
+
+#[derive(Debug)]
+enum Message {
+    Add(usize, usize, tokio::sync::oneshot::Sender<usize>)
+}
+
+#[tokio::main]
+async fn main() {
+    // - let (tx, rx) = tokio::sync::mpsc::channel(1);
+    // - let rx = Arc::new(Mutex::new(rx)); // <=== Here we make our receiver half "reliable"
+    let (tx, rx) = stage::mailbox(1);
+
+    let group = stage::group()
+        .spawn(move || {
+            // - let rx = Arc::clone(&rx);
+            let rx = rx.clone();
+            async move {
+            // while let Some(m) = rx.lock().await.recv().await {
+               loop {
+                   let m = rx.recv().await;
+                   let _ = match m {
+                       Message::Add(n, m, tx) => tx.send(n + m)
+                   };
+               }
+            }
+        }
+    );
+
+    group
+        .scope(async move {
+            loop { // <=== here we have to retry the operation until it succeedes
+                let (ttx, trx) = tokio::sync::oneshot::channel();
+                // - tx.send(Message::Add(1, 2, ttx)).await.unwrap();
+                tx.send(Message::Add(1, 2, ttx)).await;
+
+                if let Ok(res) = trx.await {
+                    assert_eq!(res, 3);
+                    break;
+                }
+            }
+        })
+        .await;
+}
+```
+
+#### Supervision Tree's
+
+TODO
 
 ### Stage: The Third Degree
 
+Stage in the third degree is similar to [bastion] or [actix]. Here we aim to
+provide the user with a declarative trait-based actor framework and a runtime
+to manage and supervise task groups, supervision trees, and the spawned actors
+themselves.
+
+In the previous sections we spoke about using `stage::group()` to establish a
+"task" primitive and rules for replication and redundancy in a way that resembles
+erlang style supervision trees, then we spoke about using extra primitives to
+enable programming of specific structured concurrency patterns for
+fault-tolerance here you can mimick erlang supervision trees in their entirety.
+
 [bastion]: https://docs.rs/bastion/
+[actix]: https://docs.rs/actix
+
+## bottom of the page

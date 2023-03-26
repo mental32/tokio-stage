@@ -3,10 +3,10 @@ use std::ops::Deref;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::TryFutureExt;
+use futures::{StreamExt, TryFutureExt};
 
+use futures::stream::FuturesUnordered;
 use tokio::sync::{mpsc, oneshot, watch};
-use tracing::Span;
 
 use crate::supervisor::{Supervisor, SupervisorMessage, SupervisorStat};
 
@@ -17,7 +17,6 @@ pub enum RestartPolicy {
 }
 
 pub(crate) struct Config {
-    pub span: Option<tracing::Span>,
     pub restart_policy: RestartPolicy,
     pub interval_dur: Duration,
     pub min_spawn: usize,
@@ -28,7 +27,6 @@ pub struct GroupBuilder(Config);
 impl Default for GroupBuilder {
     fn default() -> Self {
         Self(Config {
-            span: None,
             min_spawn: 1,
             restart_policy: RestartPolicy::UnlessAborted,
             interval_dur: Duration::from_millis(10),
@@ -49,11 +47,6 @@ impl GroupBuilder {
 
     pub fn spawn_at_least(mut self, n: usize) -> Self {
         self.0.min_spawn = n;
-        self
-    }
-
-    pub fn instrument(mut self, span: Span) -> Self {
-        self.0.span.replace(span);
         self
     }
 
@@ -167,15 +160,39 @@ impl Group {
 
     /// Scope the lifetime of the supervisor to the future provided.
     ///
-    /// When the future finishes the task group will be aborted.
-    /// See the documentation for [`Self::abort_unchecked`] for more details.
+    /// When the future finishes the task group will be shutdown.
+    /// See the documentation for [`Self::shutdown`] for more details.
     pub async fn scope<T, Fut>(self, future: Fut) -> T
     where
-        Fut: Future<Output = T> + Send + 'static,
-        Fut::Output: Send + 'static,
+        Fut: Future<Output = T> + Send,
+        Fut::Output: Send,
     {
         let t = future.await;
-        self.abort_unchecked();
+        let handles = self.shutdown().await.expect("shutdown failure");
+
+        let abort_handles = handles
+            .into_iter()
+            .map(|mut handle| {
+                let sleep = tokio::time::sleep(Duration::from_secs(1));
+
+                async move {
+                    tokio::select! {
+                        _ = sleep => {
+                            handle.abort();
+                        },
+                        _ = &mut handle => {
+                            return;
+                        }
+                    };
+                }
+            })
+            .collect::<FuturesUnordered<_>>();
+
+        tokio::spawn(async move {
+            let n = abort_handles.count().await;
+            tracing::trace!(n_handles = ?n, "group shutdown complete")
+        });
+
         t
     }
 }
@@ -260,7 +277,7 @@ mod test {
 
                     async move {
                         ctr.fetch_add(1, Ordering::SeqCst);
-                        tokio::time::sleep(Duration::from_millis(delay + 1)).await;
+                        tokio::time::sleep(Duration::from_millis(delay * 2)).await;
                     }
                 }
             });

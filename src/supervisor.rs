@@ -1,11 +1,12 @@
 use std::future::Future;
+use std::sync::Arc;
 
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 
-use tokio::sync::{mpsc, oneshot, watch};
-use tracing::Instrument;
+use tokio::sync::{mpsc, oneshot, watch, Notify};
 
+use crate::graceful_shutdown::SHUTDOWN_NOTIFY;
 use crate::group::Config;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -40,19 +41,19 @@ where
     pub fn into_future(self) -> impl Future<Output = ()> + 'static + Send {
         tracing::trace!(n = ?self.config.min_spawn, "spawning inital minimum tasks");
 
-        let span = self.config.span;
-        let spawn = move |future: Fut| {
-            if let Some(ref span) = span {
-                tokio::spawn(future.instrument(span.clone()))
-            } else {
-                tokio::spawn(future)
-            }
+        let notify = Arc::new(Notify::new());
+
+        let spawn = move |notify: Arc<Notify>, future: Fut| {
+            tokio::spawn(SHUTDOWN_NOTIFY.scope(notify, future))
         };
+
+        let notify2 = notify.clone();
+        let make_fut = move || SHUTDOWN_NOTIFY.sync_scope(notify2.clone(), || (self.make_fut)());
 
         let mut futs: FuturesUnordered<_> = (0..self.config.min_spawn)
             .map(|_| {
-                let future = (self.make_fut)();
-                spawn(future)
+                let future = make_fut();
+                spawn(notify.clone(), future)
             })
             .collect();
 
@@ -75,7 +76,7 @@ where
 
                                 tracing::trace!("task failure, restarting with replica.");
 
-                                futs.push(spawn((self.make_fut)()));
+                                futs.push(spawn(notify.clone(), make_fut()));
                                 interval.tick().await;
 
                                 self.stat.send_modify(|stat| {
@@ -88,7 +89,8 @@ where
                     },
                     Some(message) = rx.recv() => {
                         match message {
-                            SupervisorMessage::Shutdown { tx} => {
+                            SupervisorMessage::Shutdown { tx } => {
+                                notify.notify_waiters();
                                 tx.send(Vec::from_iter(futs.into_iter())).expect("shutdown failure");
                                 break;
                             }
@@ -97,8 +99,8 @@ where
                                     let diff = n - futs.len();
 
                                     futs.extend((0..diff).map(|_| {
-                                        let future = (self.make_fut)();
-                                        spawn(future)
+                                        let future = (make_fut)();
+                                        spawn(notify.clone(), future)
                                     }));
 
                                     self.stat.send_if_modified(|stat| {

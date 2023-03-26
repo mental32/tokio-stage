@@ -1,8 +1,9 @@
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 tokio::task_local! {
-    static SHUTDOWN_NOTIFY: Arc<tokio::sync::Notify>;
+    pub(crate) static SHUTDOWN_NOTIFY: Arc<tokio::sync::Notify>;
 }
 
 pub fn graceful_shutdown<F, Fut, ShutdownFut>(
@@ -10,7 +11,7 @@ pub fn graceful_shutdown<F, Fut, ShutdownFut>(
     f: F,
 ) -> impl Future<Output = Option<Fut::Output>>
 where
-    F: FnOnce(std::pin::Pin<&mut Fut>) -> ShutdownFut,
+    F: FnOnce(Pin<&mut Fut>) -> ShutdownFut,
     ShutdownFut: Future<Output = ()>,
     Fut: Future,
 {
@@ -18,17 +19,21 @@ where
         let notify = SHUTDOWN_NOTIFY.try_with(|n| Arc::clone(n));
 
         match notify {
-            Ok(notify) => loop {
-                tokio::pin!(fut);
+            Ok(notify) => {
+                let notify = notify.notified();
 
-                tokio::select! {
-                    res = &mut fut => { return Some(res) }
-                    () = notify.notified() => {
-                        f(fut).await;
-                        return None;
-                    }
+                loop {
+                    tokio::pin!(fut);
+
+                    tokio::select! {
+                        res = &mut fut => { return Some(res) }
+                        () = notify => {
+                            f(fut).await;
+                            return None;
+                        }
+                    };
                 }
-            },
+            }
             Err(_) => Some(fut.await),
         }
     }

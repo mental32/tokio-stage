@@ -285,6 +285,8 @@ mod test {
 
     use tokio::sync::Mutex;
 
+    use crate::group::RestartPolicy;
+
     #[tokio::test]
     async fn test_group_upscale() {
         let n = 10;
@@ -353,7 +355,7 @@ mod test {
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         let rx = Arc::new(Mutex::new(rx));
 
-        let group = crate::group().spawn({
+        let group = crate::group().restart_policy(RestartPolicy::Always).spawn({
             move || {
                 let ctr = Arc::clone(&ctr);
                 let rx = Arc::clone(&rx);
@@ -365,7 +367,7 @@ mod test {
                         tx.send(3).unwrap();
                     } else {
                         ctr.store(true, Ordering::SeqCst);
-                        panic!("induced failure");
+                        return;
                     }
                 }
             }

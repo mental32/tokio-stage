@@ -168,12 +168,13 @@ async fn main() {
         .spawn(move || {
             let rx = Arc::clone(&rx);
             async move {
-            while let Some(m) = rx.lock().await.recv().await {
-                let _ = match m {
-                    Message::Add(n, m, tx) => tx.send(n + m)
-                };
-            }
-        }}
+               while let Some(m) = rx.lock().await.recv().await {
+                   let _ = match m {
+                       Message::Add(n, m, tx) => tx.send(n + m)
+                   };
+               }
+           }
+        }
     );
 
     // 4. send the message and block for the response.

@@ -138,25 +138,28 @@ impl<T> MailboxReceiver<T> {
 ///     let state = Arc::new(state);
 ///     let state2 = Arc::clone(&state);
 ///     let group = stage::group()
-///         .spawn(move || {
-///         let state = Arc::clone(&state2);
-///         async move {
-///             loop {
-///                 let () = state.rx.recv().await;
-///                 if state.counter.fetch_add(1, Ordering::SeqCst) == 499 {
-///                     state.barrier.wait().await;
-///                     break;
-///                 }
-///             }
-///         }
-///     });
+///          .spawn(move || {
+///          let state = Arc::clone(&state2);
+///          async move {
+///              loop {
+///                  let () = state.rx.recv().await;
+///                  if state.counter.fetch_add(1, Ordering::SeqCst) == 499 {
+///                      state.barrier.wait().await;
+///                      break;
+///                  }
 ///
-///     for i in 0..500 {
-///         tx.send(()).await;
-///     }
-///     state.barrier.wait().await;
-///     assert_eq!(state.counter.load(Ordering::SeqCst), 500);
-/// }
+///              }
+///          }
+///      });
+///
+///      for i in 0..500 {
+///          tx.send(()).await;
+///      }
+///
+///      state.barrier.wait().await;
+///      assert_eq!(state.counter.load(Ordering::SeqCst), 500);
+///      group.exit(std::time::Duration::from_secs(1)).await;
+///  }
 /// ```
 #[inline]
 pub fn mailbox<T: Send + 'static>(capacity: usize) -> (MailboxSender<T>, MailboxReceiver<T>) {

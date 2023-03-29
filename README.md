@@ -351,24 +351,31 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::future::Future;
 use std::time::Duration;
 
-// 1.
+// 1. The task_a function takes a tokio::sync::mpsc::Sender as a parameter and
+//    returns a future that represents the task. The task sends two messages (1 and 2) over the channel.
 fn task_a(tx: tokio::sync::mpsc::Sender<usize>) -> impl Future<Output = ()> {
     let tx_2 = tx.clone();
 
-    // 2.
+    // 2. Inside task_a, a worker_fut future is created, which asynchronously
+    //    sends the value 1 over the channel and then enters a pending state.
+    //    The pending state simulates a long-running operation that doesn't complete on its own.
     let worker_fut = async move {
         tx.send(1).await;
         std::future::pending::<()>().await;
     };
 
-    // 3.
+    // 3. A shutdown_fut future is created using the stage::graceful_shutdown
+    //    function. This future wraps the worker_fut and specifies a shutdown behavior
+    //    using a closure. In this case, the shutdown behavior sends the value 2 over
+    //    the channel when the shutdown is triggered.
     let shutdown_fut = stage::graceful_shutdown(worker_fut, move |_worker_fut_pin| {
         async move {
             tx_2.send(2).await;
         }
     });
 
-   // 4.
+   // 4. The task_a function returns an async block that awaits the completion
+   //    of the shutdown_fut future.
     async move {
         let _: Option<()> = shutdown_fut.await;
     }
@@ -376,40 +383,27 @@ fn task_a(tx: tokio::sync::mpsc::Sender<usize>) -> impl Future<Output = ()> {
 
 #[tokio::main]
 async fn main() {
-    // 5.
+    // 5. In the main function, a tokio::sync::mpsc channel is created for
+    //    communication between the task and the main function.
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-    // 6.
+    // 6. A task group is created using the stage::group function and spawns
+    //    the task_a with a clone of the sender part of the channel.
     let group = stage::group()
         .spawn(move || task_a(tx.clone()));
 
-    // 7.
+    // 7. The group.scope function is called with an async block that awaits the 
+    //    first value from the channel. The scope function executes the tasks in the
+    //    group and blocks until the provided future completes. In this case, it
+    //    will complete when it receives the first value (1) from the channel.
     let t = group.scope(async { return rx.recv().await; }).await;
-    assert_eq!(t, Some(1));               // 8.1
-    assert_eq!(rx.recv().await, Some(2)); // 8.2
-    assert_eq!(rx.recv().await, None);    // 8.3
+    // 7.1 The first value received by the main function is 1.
+    assert_eq!(t, Some(1));
+    // 7.2 The second value received by the main function is 2, which is sent during the graceful shutdown.
+    assert_eq!(rx.recv().await, Some(2));
+    // 7.3 The third value received by the main function is None, indicating that the channel has been closed and no more values will be sent.
+    assert_eq!(rx.recv().await, None);
 }
 ```
-
-Here's a step-by-step description of what's happening in the code:
-
-1. The task_a function takes a tokio::sync::mpsc::Sender as a parameter and returns a future that represents the task. The task sends two messages (1 and 2) over the channel.
-
-2. Inside task_a, a worker_fut future is created, which asynchronously sends the value 1 over the channel and then enters a pending state. The pending state simulates a long-running operation that doesn't complete on its own.
-
-3. A shutdown_fut future is created using the stage::graceful_shutdown function. This future wraps the worker_fut and specifies a shutdown behavior using a closure. In this case, the shutdown behavior sends the value 2 over the channel when the shutdown is triggered.
-
-4. The task_a function returns an async block that awaits the completion of the shutdown_fut future.
-
-5. In the main function, a tokio::sync::mpsc channel is created for communication between the task and the main function.
-
-6. A task group is created using the stage::group function and spawns the task_a with a clone of the sender part of the channel.
-
-7. The group.scope function is called with an async block that awaits the first value from the channel. The scope function executes the tasks in the group and blocks until the provided future completes. In this case, it will complete when it receives the first value (1) from the channel.
-
-8. The main function verifies the expected behavior using assertions:
-   1. The first value received by the main function is 1.
-   2. The second value received by the main function is 2, which is sent during the graceful shutdown.
-   3. The third value received by the main function is None, indicating that the channel has been closed and no more values will be sent.
 
 ##### Supervision Trees
 

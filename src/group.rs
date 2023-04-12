@@ -3,8 +3,9 @@ use std::ops::Deref;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::TryFutureExt;
+use futures::{FutureExt, TryFutureExt};
 
+use futures::future::BoxFuture;
 use tokio::sync::{mpsc, watch};
 
 use crate::simple_supervisor::{
@@ -41,7 +42,7 @@ pub(crate) struct SupervisorConfig {
 /// configure group parameters before spawning the supervisor task.
 pub struct GroupBuilder(pub(super) SupervisorConfig);
 
-pub(crate) type MakePendingFut = fn() -> std::future::Pending<()>;
+pub(crate) type MakePendingFut = fn() -> BoxFuture<'static, ()>;
 
 impl GroupBuilder {
     /// Specify the restart policy for this group supervisor
@@ -92,7 +93,17 @@ impl GroupBuilder {
 
         let sv = SimpleSupervisorImpl::new(
             stat,
-            { || std::future::pending() } as _,
+            {
+                || {
+                    async {
+                        crate::graceful_shutdown::SHUTDOWN_NOTIFY
+                            .with(|n| Arc::clone(&n))
+                            .notified()
+                            .await;
+                    }
+                    .boxed()
+                }
+            } as _,
             config,
             chan_rx,
             suspend_signal,
@@ -112,7 +123,6 @@ impl GroupBuilder {
         let Self(config) = self;
         let (sv_tx, rx) = mpsc::channel(1);
         let (stat, sv_stat) = watch::channel(SupervisorStat::new());
-
         let (sv_suspend, suspend_signal) = watch::channel(SupvervisorState::Active);
 
         let sv = SimpleSupervisorImpl::new(

@@ -163,6 +163,7 @@ enum Message {
 
 #[tokio::main]
 async fn main() {
+    tracing_subscriber::fmt::init();
     // 1. create the channel same as before
     let (tx, rx) = tokio::sync::mpsc::channel(1);
     // 2. in order to make the channel "reliable" avoiding closure by dropping we must make ownership shared, and access exclusive.
@@ -178,7 +179,7 @@ async fn main() {
             async move {
                while let Some(m) = rx.lock().await.recv().await {
                    let _ = match m {
-                       Message::Add(n, m, tx) => tx.send(n + m)
+                       Message::Add(n, m, tx) => tx.send(n + m),
                    };
                }
            }
@@ -198,6 +199,9 @@ async fn main() {
             break;
         }
     }
+
+    std::mem::drop(tx);
+    group.exit(std::time::Duration::from_secs(1)).await.unwrap();
 }
 ```
 

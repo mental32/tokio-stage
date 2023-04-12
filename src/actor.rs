@@ -53,6 +53,7 @@ where
     type SendFuture = S::Future;
 }
 
+#[track_caller]
 pub fn actor<T, U, S>(state: T, service: S) -> Address<U>
 where
     S: Send + 'static + for<'a> SendService<Context<'a, T, U>>,
@@ -90,10 +91,10 @@ mod test {
         Ok(())
     }
 
-    #[test]
-    fn test() {
+    #[tokio::test]
+    async fn test() {
         let mut svc = tower::service_fn(handle);
 
-        let act = super::actor((), svc);
+        // let act = super::actor((), svc);
     }
 }

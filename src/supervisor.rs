@@ -8,8 +8,8 @@ use futures::{FutureExt, StreamExt};
 use tokio::sync::oneshot;
 use tracing::Instrument;
 
-use crate::group::MakePendingFut;
-use crate::simple_supervisor::SimpleSupervisorImpl;
+use crate::group::{MakePendingFut, RestartPolicy};
+use crate::simple_supervisor::{SimpleSupervisorImpl, SimpleSupervisorMessage};
 use crate::task::{TaskId, TaskKind};
 use crate::{Group, MailboxReceiver, MailboxSender};
 
@@ -82,8 +82,7 @@ struct SupervisorImpl {
 }
 
 impl SupervisorImpl {
-    async fn shutdown_children(&mut self) {
-        let dur = Duration::from_secs(1);
+    async fn shutdown_children(&mut self, timeout: Duration) {
         let mut futs = FuturesUnordered::new();
 
         for child in self
@@ -95,12 +94,16 @@ impl SupervisorImpl {
                 ChildState::Active(child) => Some(child),
             })
         {
-            if let Ok(()) = child.exit(dur).await {
+            if let Ok(()) = child.exit(timeout).await {
                 futs.push(child.into_pid());
             }
         }
 
-        crate::simple_supervisor::timeout_pids(Duration::from_secs(2), &mut futs).await;
+        crate::simple_supervisor::timeout_pids(
+            Duration::from_millis(timeout.as_millis() as u64 + 100),
+            &mut futs,
+        )
+        .await;
     }
 }
 
@@ -116,6 +119,7 @@ async fn supervisor_impl<F, Fut>(
     let mut sv_impl = SupervisorImpl { children: vec![] };
     let mut futs = FuturesUnordered::new();
 
+    #[derive(Debug)]
     enum Select {
         Shutdown,
         TaskExit(Option<crate::task::TaskId>),
@@ -127,23 +131,28 @@ async fn supervisor_impl<F, Fut>(
         move |_: T| -> TaskId { task_id }
     }
 
-    let notify = crate::graceful_shutdown::SHUTDOWN_NOTIFY.with(|n| Arc::clone(&n));
+    // let notify = crate::graceful_shutdown::SHUTDOWN_NOTIFY.try_with(|n| Arc::clone(&n));
 
     loop {
         let sel = tokio::select! {
             sel = sv.select() => { Select::Inner(sel) }
-            _ = notify.notified() => { Select::Shutdown },
             fut = futs.next(), if !futs.is_empty() => Select::TaskExit(fut),
             msg = rx.recv() => Select::Message(msg),
         };
 
         let m = match sel {
+            Select::Inner(crate::simple_supervisor::Select::Message(
+                SimpleSupervisorMessage::Exit { timeout },
+            )) => {
+                sv_impl.shutdown_children(timeout).await;
+                return;
+            }
             Select::Inner(sel) => {
                 sv.poll(sel).await;
                 continue;
             }
             Select::Shutdown => {
-                sv_impl.shutdown_children().await;
+                sv_impl.shutdown_children(Duration::from_secs(1)).await;
                 return;
             }
             Select::TaskExit(None) => continue,
@@ -377,14 +386,15 @@ pub fn supervisor(strategy: SupervisorStrategy) -> Supervisor {
     let inner = crate::group()
         .spawn_at_least(1)
         .task_kind(TaskKind::Super)
+        .restart_policy(RestartPolicy::OnPanic)
         .spawn_custom(move |sv, (sv_tx, sv_stat, sv_suspend)| {
-            let fut = {
-                supervisor_impl::<MakePendingFut, _>(sv, rx, strategy).instrument(
-                    tracing::trace_span!(
+            let fut = async move {
+                supervisor_impl::<MakePendingFut, _>(sv, rx, strategy)
+                    .instrument(tracing::trace_span!(
                         "supervisor",
                         current_task_id = crate::task::current_task_id()
-                    ),
-                )
+                    ))
+                    .await;
             };
 
             let pid = crate::task::spawn(fut, crate::task::TaskKind::Super);
@@ -416,6 +426,7 @@ mod test {
         let notfied = NOTIFY.notified();
 
         let group = crate::group().spawn(example_task);
+
         let child_ref = sup.add_child(group).await;
 
         notfied.await;

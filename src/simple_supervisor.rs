@@ -129,7 +129,7 @@ impl<F> SimpleSupervisorImpl<F> {
                     return Select::Nop;
                 }
             }
-            res = self.running.next() => {
+            res = self.running.next(), if !self.running.is_empty() => {
                 Select::Future(res)
             },
             Some(message) = self.chan_rx.recv() => {
@@ -232,19 +232,27 @@ where
         });
     }
 
-    pub(crate) async fn poll(&mut self, sel: Select) {
+    pub(crate) async fn poll(&mut self, sel: Select) -> bool {
         match sel {
-            Select::Nop => return,
+            Select::Nop => return false,
             Select::Suspend => {
                 self.suspend().await;
+                return false;
             }
-            Select::Future(None) => return,
-            Select::Future(Some(res)) => self.handle_task_exit(res),
+            Select::Future(None) => return false,
+            Select::Future(Some(res)) => {
+                self.handle_task_exit(res);
+                return false;
+            }
             Select::Message(SimpleSupervisorMessage::Exit { timeout }) => {
                 tracing::trace!(?timeout, "processing exit message");
                 self.shutdown_children(timeout).await;
+                return true;
             }
-            Select::Message(SimpleSupervisorMessage::Upscale { n }) => self.try_upscale(n),
+            Select::Message(SimpleSupervisorMessage::Upscale { n }) => {
+                self.try_upscale(n);
+                return false;
+            }
         }
     }
 }
@@ -272,7 +280,9 @@ where
             loop {
                 let sel = self.select().await;
                 tracing::trace!(?sel, "simple-supervisor event loop select");
-                self.poll(sel).await;
+                if self.poll(sel).await {
+                    break;
+                }
             }
         }
         .instrument(span)

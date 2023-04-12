@@ -162,6 +162,7 @@ impl<T> MailboxReceiver<T> {
 ///  }
 /// ```
 #[inline]
+#[track_caller]
 pub fn mailbox<T: Send + 'static>(capacity: usize) -> (MailboxSender<T>, MailboxReceiver<T>) {
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
     let channel = MailboxChannel(tx);

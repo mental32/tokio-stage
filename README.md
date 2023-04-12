@@ -151,8 +151,6 @@ Now lets see the code if we use a `stage::group` and address the issues.
 ##### Code snippet 1.2
 
 ```rust
-use stage::prelude::*;
-
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -294,8 +292,6 @@ We'll modify the code from the previous section to use a mailbox:
 ##### Code snippet 2.1
 
 ```rust
-use stage::prelude::*;
-
 use std::sync::Arc;
 use tokio::sync::Mutex;
 

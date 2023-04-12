@@ -2,17 +2,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use tokio::sync::Notify;
-
 tokio::task_local! {
     pub(crate) static SHUTDOWN_NOTIFY: Arc<tokio::sync::Notify>;
-}
-
-pub(crate) async fn shutdown_scope<T, Fut>(signal: Arc<Notify>, fut: Fut) -> T
-where
-    Fut: Future<Output = T>,
-{
-    SHUTDOWN_NOTIFY.scope(signal, fut).await
 }
 
 /// wrap

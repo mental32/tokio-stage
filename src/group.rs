@@ -1,5 +1,6 @@
 use std::future::Future;
 use std::ops::Deref;
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures::TryFutureExt;
@@ -7,7 +8,8 @@ use futures::TryFutureExt;
 use tokio::sync::{mpsc, watch};
 
 use crate::simple_supervisor::{
-    SimpleSupervisor, SimpleSupervisorMessage, SupervisorSignalTx, SupervisorStat, SupvervisorState,
+    SimpleSupervisorImpl, SimpleSupervisorMessage, SupervisorSignalTx, SupervisorStat,
+    SupvervisorState,
 };
 use crate::task::TaskKind;
 
@@ -38,6 +40,8 @@ pub(crate) struct SupervisorConfig {
 
 /// configure group parameters before spawning the supervisor task.
 pub struct GroupBuilder(pub(super) SupervisorConfig);
+
+pub(crate) type MakePendingFut = fn() -> std::future::Pending<()>;
 
 impl GroupBuilder {
     /// Specify the restart policy for this group supervisor
@@ -70,6 +74,35 @@ impl GroupBuilder {
         self
     }
 
+    pub(crate) fn spawn_custom<F, T>(self, f: F) -> T
+    where
+        F: FnOnce(
+            SimpleSupervisorImpl<MakePendingFut>,
+            (
+                mpsc::Sender<SimpleSupervisorMessage>,
+                watch::Receiver<SupervisorStat>,
+                watch::Sender<SupvervisorState>,
+            ),
+        ) -> T,
+    {
+        let Self(config) = self;
+        let (sv_tx, chan_rx) = mpsc::channel(1);
+        let (stat, sv_stat) = watch::channel(SupervisorStat::new());
+        let (sv_suspend, suspend_signal) = watch::channel(SupvervisorState::Active);
+
+        let sv = SimpleSupervisorImpl::new(
+            stat,
+            { || std::future::pending() } as _,
+            config,
+            chan_rx,
+            suspend_signal,
+            Default::default(),
+            Default::default(),
+        );
+
+        (f)(sv, (sv_tx, sv_stat, sv_suspend))
+    }
+
     /// Spawn the group supervisor for workers using the provided future constructor
     pub fn spawn<F, Fut>(self, f: F) -> Group
     where
@@ -80,18 +113,20 @@ impl GroupBuilder {
         let (sv_tx, rx) = mpsc::channel(1);
         let (stat, sv_stat) = watch::channel(SupervisorStat::new());
 
-        let (sv_suspend, signal) = watch::channel(SupvervisorState::Active);
+        let (sv_suspend, suspend_signal) = watch::channel(SupvervisorState::Active);
 
-        let sv = SimpleSupervisor {
+        let sv = SimpleSupervisorImpl::new(
             stat,
-            chan_rx: rx,
-            make_fut: f,
+            f,
             config,
-            signal,
-        };
+            rx,
+            suspend_signal,
+            Default::default(),
+            Default::default(),
+        );
 
         let sv_handle = crate::task::spawn(
-            async move { sv.into_future().await },
+            async move { std::future::IntoFuture::into_future(sv).await },
             crate::task::TaskKind::Super,
         );
 
@@ -112,6 +147,22 @@ pub(crate) struct Inner {
     sv_stat: watch::Receiver<SupervisorStat>,
     sv_handle: crate::task::Pid<()>,
     sv_suspend: SupervisorSignalTx,
+}
+
+impl Inner {
+    pub(crate) fn new(
+        sv_tx: mpsc::Sender<SimpleSupervisorMessage>,
+        sv_stat: watch::Receiver<SupervisorStat>,
+        sv_handle: crate::task::Pid<()>,
+        sv_suspend: SupervisorSignalTx,
+    ) -> Self {
+        Self {
+            sv_tx,
+            sv_stat,
+            sv_handle,
+            sv_suspend,
+        }
+    }
 }
 
 impl Into<crate::task::Pid<()>> for Inner {

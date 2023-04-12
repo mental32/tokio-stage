@@ -1,9 +1,10 @@
-use std::future::Future;
+use std::future::{Future, IntoFuture};
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 
 use tokio::sync::{mpsc, watch, Notify};
 use tracing::Instrument;
@@ -73,20 +74,69 @@ pub(crate) enum SimpleSupervisorMessage {
     Exit { timeout: Duration },
 }
 
-pub(crate) struct SimpleSupervisor<F> {
+pub(crate) struct SimpleSupervisorImpl<F> {
     pub stat: watch::Sender<SupervisorStat>,
+    pub make_fut: F,
+    pub config: SupervisorConfig,
     pub chan_rx: mpsc::Receiver<SimpleSupervisorMessage>,
-    pub make_fut: F,
-    pub config: SupervisorConfig,
-    pub signal: SupervisorSignal,
-}
-
-struct SimpleSupervisorImpl<F> {
-    pub stat: watch::Sender<SupervisorStat>,
-    pub make_fut: F,
-    pub config: SupervisorConfig,
+    pub suspend_signal: SupervisorSignal,
     shutdown_notify: Arc<Notify>,
     running: FuturesUnordered<crate::task::Pid<()>>,
+}
+
+#[derive(Debug)]
+pub(crate) enum Select {
+    Future(Option<Result<((), crate::task::TaskId), tokio::task::JoinError>>),
+    Message(SimpleSupervisorMessage),
+    Suspend,
+    Nop,
+}
+
+impl<F> SimpleSupervisorImpl<F> {
+    pub(crate) fn new(
+        stat: watch::Sender<SupervisorStat>,
+        make_fut: F,
+        config: SupervisorConfig,
+        chan_rx: mpsc::Receiver<SimpleSupervisorMessage>,
+        suspend_signal: SupervisorSignal,
+        shutdown_notify: Arc<Notify>,
+        running: FuturesUnordered<crate::task::Pid<()>>,
+    ) -> Self {
+        Self {
+            stat,
+            make_fut,
+            config,
+            chan_rx,
+            suspend_signal,
+            shutdown_notify,
+            running,
+        }
+    }
+
+    async fn shutdown_children(&mut self, timeout: Duration) {
+        self.shutdown_notify.notify_waiters();
+        timeout_pids(timeout, &mut self.running).await
+    }
+
+    pub(crate) async fn select(&mut self) -> Select {
+        let suspend_signal = &mut self.suspend_signal;
+
+        tokio::select! {
+            _ = suspend_signal.changed() => {
+                if matches!(*suspend_signal.borrow(), SupvervisorState::Suspend) {
+                    Select::Suspend
+                } else {
+                    return Select::Nop;
+                }
+            }
+            res = self.running.next() => {
+                Select::Future(res)
+            },
+            Some(message) = self.chan_rx.recv() => {
+                Select::Message(message)
+            },
+        }
+    }
 }
 
 impl<F, Fut> SimpleSupervisorImpl<F>
@@ -95,11 +145,6 @@ where
     Fut: 'static + Send + Future<Output = ()>,
     Fut::Output: 'static + Send,
 {
-    async fn shutdown_children(&mut self, timeout: Duration) {
-        self.shutdown_notify.notify_waiters();
-        timeout_pids(timeout, &mut self.running).await
-    }
-
     async fn suspend_until_resume<ResumeFut>(&mut self, resume_signal: ResumeFut)
     where
         ResumeFut: Future,
@@ -119,6 +164,17 @@ where
         }
     }
 
+    fn try_upscale(&mut self, n: usize) {
+        if self.running.len() <= n {
+            let diff = n - self.running.len();
+
+            for _ in 0..diff {
+                let pid = self.spawn((self.make_fut)());
+                self.running.push(pid);
+            }
+        }
+    }
+
     fn spawn(&self, fut: Fut) -> crate::task::Pid<Fut::Output> {
         let pid = crate::task::spawn(
             SHUTDOWN_NOTIFY.scope(self.shutdown_notify.clone(), fut),
@@ -129,131 +185,97 @@ where
 
         pid
     }
+
+    fn handle_task_exit(&mut self, res: Result<((), crate::task::TaskId), tokio::task::JoinError>) {
+        let task_id = res.as_ref().ok().map(|ab| ab.1);
+        let span = tracing::trace_span!("task-exit", task_id = task_id);
+        let _guard = span.enter();
+
+        tracing::trace!(result = ?res, is_err = res.is_err(), "task has exited");
+
+        if self.config.restart_policy.should_restart(&res) {
+            tracing::trace!("restart policy task restart");
+            let pid = self.spawn((self.make_fut)());
+            self.running.push(pid);
+        } else {
+            tracing::trace!("task will not be restarted");
+            if self.config.automatic_shutdown && self.running.is_empty() {
+                return;
+            }
+        }
+    }
+
+    async fn suspend(&mut self) {
+        tracing::trace!("supervisor shutdown notification");
+        let mut suspend_signal = self.suspend_signal.clone();
+        let _ = self.stat.send(SupervisorStat {
+            state: SupvervisorState::Suspend,
+        });
+        self.suspend_until_resume(
+            async move {
+                loop {
+                    tracing::trace!(status = ?suspend_signal.borrow(), "resume checking signal status");
+                    if matches!(*suspend_signal.borrow(), SupvervisorState::Active)
+                    {
+                        break;
+                    }
+                    if suspend_signal.changed().await.is_err() {
+                        break;
+                    }
+                }
+            }
+            .instrument(tracing::trace_span!("resume")),
+        )
+        .await;
+        let _ = self.stat.send(SupervisorStat {
+            state: SupvervisorState::Active,
+        });
+    }
+
+    pub(crate) async fn poll(&mut self, sel: Select) {
+        match sel {
+            Select::Nop => return,
+            Select::Suspend => {
+                self.suspend().await;
+            }
+            Select::Future(None) => return,
+            Select::Future(Some(res)) => self.handle_task_exit(res),
+            Select::Message(SimpleSupervisorMessage::Exit { timeout }) => {
+                tracing::trace!(?timeout, "processing exit message");
+                self.shutdown_children(timeout).await;
+            }
+            Select::Message(SimpleSupervisorMessage::Upscale { n }) => self.try_upscale(n),
+        }
+    }
 }
 
-impl<F, Fut> SimpleSupervisor<F>
+impl<F, Fut> IntoFuture for SimpleSupervisorImpl<F>
 where
     F: 'static + Clone + Send + Fn() -> Fut,
     Fut: 'static + Send + Future<Output = ()>,
     Fut::Output: 'static + Send,
 {
-    #[track_caller]
-    pub fn into_future(self) -> impl Future<Output = ()> + 'static + Send {
-        let current_task_id: crate::task::TaskId = crate::task::current_task_id();
+    type Output = ();
+
+    type IntoFuture = BoxFuture<'static, Self::Output>;
+
+    fn into_future(mut self) -> Self::IntoFuture {
+        let current_task_id = crate::task::try_current_task_id();
         let span = tracing::trace_span!("simple-supervisor", current_task_id);
-        let _guard = span.enter();
-
-        let spawn_at_least = self.config.spawn_at_least;
-        tracing::trace!(target = ?spawn_at_least, "spawning inital minimum tasks");
-
-        let Self {
-            stat,
-            chan_rx,
-            make_fut,
-            config,
-            signal: mut suspend_signal,
-        } = self;
-
-        let mut rx = chan_rx;
-        let mut this = SimpleSupervisorImpl {
-            shutdown_notify: Arc::new(Notify::new()),
-            running: FuturesUnordered::new(),
-            stat,
-            make_fut,
-            config,
-        };
-
-        this.upscale_to_minimum();
-
-        #[derive(Debug)]
-        enum Select {
-            Future(Option<Result<((), crate::task::TaskId), tokio::task::JoinError>>),
-            Message(SimpleSupervisorMessage),
-            Suspend,
-        }
 
         async move {
-            let mut this = this;
+            let spawn_at_least = self.config.spawn_at_least;
+            tracing::trace!(target = ?spawn_at_least, "spawning inital minimum tasks");
+
+            self.upscale_to_minimum();
 
             loop {
-                let sel = tokio::select! {
-                    _ = suspend_signal.changed() => {
-                        if matches!(*suspend_signal.borrow(), SupvervisorState::Suspend) {
-                            Select::Suspend
-                        } else {
-                            continue;
-                        }
-                    }
-                    res = this.running.next() => {
-                        Select::Future(res)
-                    },
-                    Some(message) = rx.recv() => {
-                        Select::Message(message)
-                    },
-                };
-
+                let sel = self.select().await;
                 tracing::trace!(?sel, "simple-supervisor event loop select");
-
-                match sel {
-                    Select::Suspend => {
-                        tracing::trace!("supervisor shutdown notification");
-                        let mut suspend_signal = suspend_signal.clone();
-                        let _ = this.stat.send(SupervisorStat { state: SupvervisorState::Suspend });
-                        this.suspend_until_resume(
-                            async move {
-                                loop {
-                                    tracing::trace!(status = ?suspend_signal.borrow(), "resume checking signal status");
-                                    if matches!(*suspend_signal.borrow(), SupvervisorState::Active)
-                                    {
-                                        break;
-                                    }
-                                    if suspend_signal.changed().await.is_err() {
-                                        break;
-                                    }
-                                }
-                            }
-                            .instrument(tracing::trace_span!("resume")),
-                        )
-                        .await;
-                        let _ = this.stat.send(SupervisorStat { state: SupvervisorState::Active });
-                        continue;
-                    }
-                    Select::Future(None) => continue,
-                    Select::Future(Some(res)) => {
-                        let task_id = res.as_ref().ok().map(|ab| ab.1);
-                        let span = tracing::trace_span!("task-exit", task_id = task_id);
-                        let _guard = span.enter();
-
-                        tracing::trace!(result = ?res, is_err = res.is_err(), "task has exited");
-
-                        if this.config.restart_policy.should_restart(&res) {
-                            tracing::trace!("restart policy task restart");
-                            let pid = this.spawn((this.make_fut)());
-                            this.running.push(pid);
-                        } else {
-                            tracing::trace!("task will not be restarted");
-                            if this.config.automatic_shutdown && this.running.is_empty() {
-                                return;
-                            }
-                        }
-                    }
-                    Select::Message(SimpleSupervisorMessage::Exit { timeout }) => {
-                        tracing::trace!(?timeout, "processing exit message");
-                        this.shutdown_children(timeout).await;
-                        return;
-                    }
-                    Select::Message(SimpleSupervisorMessage::Upscale { n }) => {
-                        if this.running.len() <= n {
-                            let diff = n - this.running.len();
-
-                            for _ in 0..diff {
-                                let pid = this.spawn((this.make_fut)());
-                                this.running.push(pid);
-                            }
-                        }
-                    }
-                }
+                self.poll(sel).await;
             }
-        }.instrument(span.clone())
+        }
+        .instrument(span)
+        .boxed()
     }
 }

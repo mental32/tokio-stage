@@ -80,3 +80,8 @@ where
 pub(crate) fn current_task_id() -> u64 {
     CURRENT_TASK_ID.get()
 }
+
+#[track_caller]
+pub(crate) fn try_current_task_id() -> u64 {
+    CURRENT_TASK_ID.try_with(|n| *n).unwrap_or(0)
+}

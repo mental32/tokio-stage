@@ -8,6 +8,8 @@ use futures::{FutureExt, StreamExt};
 use tokio::sync::oneshot;
 use tracing::Instrument;
 
+use crate::group::MakePendingFut;
+use crate::simple_supervisor::SimpleSupervisorImpl;
 use crate::task::{TaskId, TaskKind};
 use crate::{Group, MailboxReceiver, MailboxSender};
 
@@ -102,7 +104,15 @@ impl SupervisorImpl {
     }
 }
 
-async fn supervisor_impl(rx: MailboxReceiver<SupervisorMessage>, strategy: SupervisorStrategy) {
+async fn supervisor_impl<F, Fut>(
+    mut sv: SimpleSupervisorImpl<F>,
+    rx: MailboxReceiver<SupervisorMessage>,
+    strategy: SupervisorStrategy,
+) where
+    F: 'static + Clone + Send + Fn() -> Fut,
+    Fut: 'static + Send + std::future::Future<Output = ()>,
+    Fut::Output: 'static + Send,
+{
     let mut sv_impl = SupervisorImpl { children: vec![] };
     let mut futs = FuturesUnordered::new();
 
@@ -110,6 +120,7 @@ async fn supervisor_impl(rx: MailboxReceiver<SupervisorMessage>, strategy: Super
         Shutdown,
         TaskExit(Option<crate::task::TaskId>),
         Message(SupervisorMessage),
+        Inner(crate::simple_supervisor::Select),
     }
 
     fn map_to_task_id<T>(task_id: TaskId) -> impl FnOnce(T) -> TaskId {
@@ -120,12 +131,17 @@ async fn supervisor_impl(rx: MailboxReceiver<SupervisorMessage>, strategy: Super
 
     loop {
         let sel = tokio::select! {
+            sel = sv.select() => { Select::Inner(sel) }
             _ = notify.notified() => { Select::Shutdown },
             fut = futs.next(), if !futs.is_empty() => Select::TaskExit(fut),
             msg = rx.recv() => Select::Message(msg),
         };
 
         let m = match sel {
+            Select::Inner(sel) => {
+                sv.poll(sel).await;
+                continue;
+            }
             Select::Shutdown => {
                 sv_impl.shutdown_children().await;
                 return;
@@ -361,18 +377,24 @@ pub fn supervisor(strategy: SupervisorStrategy) -> Supervisor {
     let inner = crate::group()
         .spawn_at_least(1)
         .task_kind(TaskKind::Super)
-        .spawn(move || {
-            let rx = rx.clone();
-            async move { (rx, strategy) }.then(|(rx, strategy)| {
-                supervisor_impl(rx, strategy).instrument(tracing::trace_span!(
-                    "supervisor",
-                    current_task_id = crate::task::current_task_id()
-                ))
-            })
+        .spawn_custom(move |sv, (sv_tx, sv_stat, sv_suspend)| {
+            let fut = {
+                supervisor_impl::<MakePendingFut, _>(sv, rx, strategy).instrument(
+                    tracing::trace_span!(
+                        "supervisor",
+                        current_task_id = crate::task::current_task_id()
+                    ),
+                )
+            };
+
+            let pid = crate::task::spawn(fut, crate::task::TaskKind::Super);
+
+            crate::group::Inner::new(sv_tx, sv_stat, pid, sv_suspend)
         });
+
     Supervisor {
         sv_tx: tx,
-        sv_group: inner,
+        sv_group: crate::group::Group { inner },
     }
 }
 

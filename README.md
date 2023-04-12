@@ -17,6 +17,7 @@ Self-healing and Fault-tolerance library for Tokio Applications
       - [Graceful Shutdown](#graceful-shutdown)
       - [Code snippet 2.2](#code-snippet-22)
       - [Supervision Trees](#supervision-trees)
+      - [Code snippet 2.3](#code-snippet-23)
     - [Stage: The Third Degree](#stage-the-third-degree)
 - [bottom of the page](#bottom-of-the-page)
 
@@ -407,9 +408,7 @@ async fn main() {
 
 ##### Supervision Trees
 
-In this section, we will introduce the concept of supervision trees and
-demonstrate how they can be utilized to create a robust and fault-tolerant
-system. Supervision trees in Stage are inspired by Erlang/OTP supervision trees
+Supervision trees in Stage are inspired by Erlang/OTP supervision trees
 and will use task groups as the nodes.
 
 A supervision tree is a hierarchical structure that allows you to manage a set
@@ -419,7 +418,54 @@ react to failures within its nodes. This enables you to isolate faults, manage
 dependencies, and automatically restart failed tasks, ultimately making your
 application more resilient.
 
-Let's see an example of how to build a supervision tree with Stage.
+##### Code snippet 2.3
+
+```rust
+async fn task_a() {
+    std::future::pending().await
+}
+
+fn group_task_a() -> stage::Group {
+    stage::group().spawn(task_a)
+}
+
+#[tokio::main]
+async fn main() {
+    let sv1 = stage::supervisor(stage::SupervisorStrategy::OneForOne);
+    let child1 = sv1.add_child(group_task_a()).await;
+    let sv2 = stage::supervisor(stage::SupervisorStrategy::OneForAll);
+    let child2 = sv2.add_child(group_task_a()).await;
+    let child3 = sv1.add_child(sv2).await;
+}
+```
+
+```text
+           sv1
+        /   |   
+  child1  sv2
+            |
+        child2
+```
+
+The supervision tree consists of the following components:
+
+1. sv1 is a supervisor created using the stage::supervisor function with the
+   OneForOne strategy. It means that if a child node fails, only the failed
+   child will be restarted.
+
+2. child1 is a task group created by group_task_a and added to sv1 as a child.
+
+3. sv2 is another supervisor created using the stage::supervisor function with
+   the OneForAll strategy. It means that if a child node fails, all children
+   under this supervisor will be restarted. sv2 is added as a child of sv1.
+
+4. child2 is a task group created by group_task_a and added to sv2 as a child.
+
+In this supervision tree, sv1 is the root node, and sv2 is an intermediate
+node. The tree provides a fault-tolerant structure, allowing tasks to be
+monitored and restarted depending on the chosen supervisor strategy. In this
+example, the two supervisors (sv1 and sv2) apply different restart strategies
+for their respective child nodes.
 
 #### Stage: The Third Degree
 

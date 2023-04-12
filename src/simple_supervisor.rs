@@ -9,7 +9,7 @@ use tokio::sync::{mpsc, watch, Notify};
 use tracing::Instrument;
 
 use crate::graceful_shutdown::SHUTDOWN_NOTIFY;
-use crate::group::GroupConfig;
+use crate::group::SupervisorConfig;
 
 pub(crate) async fn timeout_pids<T: std::fmt::Debug>(
     timeout: Duration,
@@ -77,14 +77,14 @@ pub(crate) struct SimpleSupervisor<F> {
     pub stat: watch::Sender<SupervisorStat>,
     pub chan_rx: mpsc::Receiver<SimpleSupervisorMessage>,
     pub make_fut: F,
-    pub config: GroupConfig,
+    pub config: SupervisorConfig,
     pub signal: SupervisorSignal,
 }
 
 struct SimpleSupervisorImpl<F> {
     pub stat: watch::Sender<SupervisorStat>,
     pub make_fut: F,
-    pub config: GroupConfig,
+    pub config: SupervisorConfig,
     shutdown_notify: Arc<Notify>,
     running: FuturesUnordered<crate::task::Pid<()>>,
 }

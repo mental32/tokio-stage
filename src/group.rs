@@ -27,49 +27,50 @@ impl RestartPolicy {
     }
 }
 
-pub(crate) struct GroupConfig {
+pub(crate) struct SupervisorConfig {
     pub restart_policy: RestartPolicy,
     pub interval_dur: Duration,
     pub spawn_at_least: usize,
     pub task_kind: TaskKind,
     pub automatic_shutdown: bool,
+    pub shutdown_timeout: Duration,
 }
 
-pub struct GroupBuilder(GroupConfig);
-
-impl Default for GroupBuilder {
-    fn default() -> Self {
-        Self(GroupConfig {
-            automatic_shutdown: true,
-            spawn_at_least: 1,
-            restart_policy: RestartPolicy::OnPanic,
-            interval_dur: Duration::from_millis(10),
-            task_kind: TaskKind::Worker,
-        })
-    }
-}
+/// configure group parameters before spawning the supervisor task.
+pub struct GroupBuilder(pub(super) SupervisorConfig);
 
 impl GroupBuilder {
+    /// Specify the restart policy for this group supervisor
     pub fn restart_policy(mut self, policy: RestartPolicy) -> Self {
         self.0.restart_policy = policy;
         self
     }
 
+    /// Specify how long to wait for a worker task to respond to a shutdown signal before aborting it
+    pub fn shutdown_timeout(mut self, dur: Duration) -> Self {
+        self.0.shutdown_timeout = dur;
+        self
+    }
+
+    /// a
     pub fn spawn_interval(mut self, dur: Duration) -> Self {
         self.0.interval_dur = dur;
         self
     }
 
+    /// The number of minimum worker tasks to spawn
     pub fn spawn_at_least(mut self, n: usize) -> Self {
         self.0.spawn_at_least = n;
         self
     }
 
+    /// The type (kind) of this task, worker or supervisor.
     pub(crate) fn task_kind(mut self, kind: TaskKind) -> Self {
         self.0.task_kind = kind;
         self
     }
 
+    /// Spawn the group supervisor for workers using the provided future constructor
     pub fn spawn<F, Fut>(self, f: F) -> Group
     where
         F: Send + Clone + Fn() -> Fut + 'static,
@@ -119,6 +120,7 @@ impl Into<crate::task::Pid<()>> for Inner {
     }
 }
 
+/// A unique, owned, handle used to control the underlying syupervisor task.
 #[derive(Debug)]
 pub struct Group {
     pub(crate) inner: Inner,
@@ -191,6 +193,7 @@ impl Group {
         self.inner.sv_handle.abort();
     }
 
+    /// a read-only idempotent handle that allows observing the task
     #[inline]
     pub fn to_group_ref(&self) -> GroupRef {
         GroupRef {

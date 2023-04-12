@@ -8,13 +8,14 @@ tokio::task_local! {
     pub(crate) static SHUTDOWN_NOTIFY: Arc<tokio::sync::Notify>;
 }
 
-pub async fn shutdown_scope<T, Fut>(signal: Arc<Notify>, fut: Fut) -> T
+pub(crate) async fn shutdown_scope<T, Fut>(signal: Arc<Notify>, fut: Fut) -> T
 where
     Fut: Future<Output = T>,
 {
     SHUTDOWN_NOTIFY.scope(signal, fut).await
 }
 
+/// wrap
 pub fn graceful_shutdown<F, Fut, ShutdownFut>(
     fut: Fut,
     f: F,

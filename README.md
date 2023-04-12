@@ -1,25 +1,28 @@
-Stage
-Self-healing and Fault-tolerance library for Tokio Applications
+# Stage
+## Self-healing and Fault-tolerance library for Tokio Applications
 
-- [Brief](#brief)
-  - [Features](#features)
-  - [Alternatives](#alternatives)
-  - ["Why Use Stage?"](#why-use-stage)
-  - [Stage: Tutorial](#stage-tutorial)
-    - [Stage: The First Degree](#stage-the-first-degree)
-      - [Code snippet 1.1](#code-snippet-11)
-      - [Code snippet 1.2](#code-snippet-12)
-      - [Code snippet 1.3](#code-snippet-13)
-      - [Conclusion](#conclusion)
-    - [Stage: The Second Degree](#stage-the-second-degree)
-      - [Mailbox](#mailbox)
-      - [Code snippet 2.1](#code-snippet-21)
-      - [Graceful Shutdown](#graceful-shutdown)
-      - [Code snippet 2.2](#code-snippet-22)
-      - [Supervision Trees](#supervision-trees)
-      - [Code snippet 2.3](#code-snippet-23)
-    - [Stage: The Third Degree](#stage-the-third-degree)
-- [bottom of the page](#bottom-of-the-page)
+- [Stage](#stage)
+  - [Self-healing and Fault-tolerance library for Tokio Applications](#self-healing-and-fault-tolerance-library-for-tokio-applications)
+  - [Brief](#brief)
+    - [Features](#features)
+    - [Other Similar Crates](#other-similar-crates)
+    - ["Why Use Stage?"](#why-use-stage)
+    - ["Why is it called Stage?"](#why-is-it-called-stage)
+    - [Stage: Tutorial](#stage-tutorial)
+      - [Stage: The First Degree](#stage-the-first-degree)
+        - [Code snippet 1.1](#code-snippet-11)
+        - [Code snippet 1.2](#code-snippet-12)
+        - [Code snippet 1.3](#code-snippet-13)
+        - [Conclusion](#conclusion)
+      - [Stage: The Second Degree](#stage-the-second-degree)
+        - [Mailbox](#mailbox)
+        - [Code snippet 2.1](#code-snippet-21)
+        - [Graceful Shutdown](#graceful-shutdown)
+        - [Code snippet 2.2](#code-snippet-22)
+        - [Supervision Trees](#supervision-trees)
+        - [Code snippet 2.3](#code-snippet-23)
+      - [Stage: The Third Degree](#stage-the-third-degree)
+  - [bottom of the page](#bottom-of-the-page)
 
 ## Brief
 
@@ -34,11 +37,11 @@ the benefits stage would provide.
 
 * groups: making tokio tasks restartable and scalable
 * mailbox: in-memory channel with reliable message delivery guarantees
-* supervion: composing groups together to enable erlang-style [supervision-trees]
+* supervision: composing groups together to enable erlang-style [supervision-trees]
 
 [supervision-trees]: https://erlang.org/documentation/doc-4.9.1/doc/design_principles/sup_princ.html
 
-### Alternatives
+### Other Similar Crates
 
 * [bastion] - Highly-available Distributed Fault-tolerant Runtime
 * [zestors] - A fast and flexible actor-framework for building fault-tolerant Rust applications
@@ -47,7 +50,7 @@ the benefits stage would provide.
 * [lunatic] - Lunatic is an Erlang-inspired runtime for WebAssembly
 
 Not to mention the infinite list of actor library/framework crates that have
-been published and abandoned floating around on crates.io
+been published and abandoned on crates.io
 
 ### "Why Use Stage?"
 
@@ -66,6 +69,10 @@ been published and abandoned floating around on crates.io
    Stage is designed as a set of abstractions that are simply reusing tokio
    features and provide compatability with other tokio ecosystem projects like
    [tower], [console], and [tracing]
+
+### "Why is it called Stage?"
+
+It's a pun! The stage is where actors get their work done.
 
 ### Stage: Tutorial
 
@@ -89,7 +96,7 @@ that is responsible for restarting, upscaling, and aborting/shutting down the
 tasks. The erlang analog here is a supervisor with a `:simple_one_for_one`
 strategy.
 
-Let us walk through an exmple of porting some existing code from using
+Let us walk through an example of porting some existing code from using
 `tokio::spawn` to `stage::spawn`.
 
 ##### Code snippet 1.1

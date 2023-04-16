@@ -1,19 +1,39 @@
+use std::future::Future;
+
+use futures::FutureExt;
 use tower::ServiceExt;
 
-use crate::task::TaskKind;
 use crate::MailboxSender;
 
-struct Actor<T, S> {
-    state: T,
-    service: S,
-}
-
+/// actor context parameter that is generated for the underlying service to handle
 pub struct Context<'a, T, U> {
     state: &'a mut T,
     inner: U,
 }
 
+impl<'a, T, U> Context<'a, T, U> {
+    /// access the internal state by a borrow
+    #[inline]
+    pub fn as_ref(&self) -> &T {
+        &self.state
+    }
+
+    /// access the internal state by a mutable borrow
+    #[inline]
+    pub fn as_mut(&mut self) -> &mut T {
+        self.state
+    }
+
+    /// destruct the current context into a tuple of the state and inner request
+    #[inline]
+    pub fn into_parts(self) -> (&'a mut T, U) {
+        (self.state, self.inner)
+    }
+}
+
+/// used to convert types into an instance of [`Context`]
 pub trait IntoContext<'a, T> {
+    /// cast self into a context
     fn into_context(self, t: &'a mut T) -> Context<'a, T, Self>
     where
         Self: Sized;
@@ -31,18 +51,9 @@ impl<'a, T, U> IntoContext<'a, T> for U {
     }
 }
 
-pub struct Address<U> {
-    pid: crate::task::Pid<()>,
-    tx: MailboxSender<U>,
-}
-
-impl<U> Address<U> {
-    pub async fn send(&self, u: U) {
-        self.tx.send(u).await
-    }
-}
-
+/// [`tower::Service`] with a [`Send`] requirement on the service future
 pub trait SendService<T>: tower::Service<T, Future = Self::SendFuture> {
+    /// [tower::Service::Future] but with a [Send] requirement
     type SendFuture: Send;
 }
 
@@ -53,8 +64,53 @@ where
     type SendFuture = S::Future;
 }
 
-#[track_caller]
-pub fn actor<T, U, S>(state: T, service: S) -> Address<U>
+#[pin_project::pin_project]
+pub struct Actor<Fut, U> {
+    #[pin]
+    fut: Fut,
+    tx: MailboxSender<U>,
+}
+
+impl<Fut, U> Future for Actor<Fut, U>
+where
+    Fut: Future<Output = U> + Send + 'static,
+{
+    type Output = Fut::Output;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        self.project().fut.poll_unpin(cx)
+    }
+}
+
+/// Given some state and a service ([`tower::Service`]) construct an [`Actor`].
+///
+/// Actors in other frameworks are managed, spawning and lifecycle is handled by default.
+/// however in stage actors must be explicitly constructed and inserted into supervision structures
+/// like a [`crate::Supervisor`] or a [`crate::Group`].
+///
+/// # Example
+///
+/// ```
+/// use stage::Context;
+///
+/// async fn handle<'a>(_r: Context<'a, (), ()>) -> Result<(), ()> {
+///     Ok(())
+/// }
+///
+/// #[tokio::main]
+/// async fn main() {
+///     let group = stage::group().spawn(|| {
+///         let svc = tower::service_fn(handle);
+///         stage::actor((), svc)
+///     });
+///     
+///     group.scope(tokio::time::sleep(std::time::Duration::from_millis(10))).await;
+/// }
+/// ```
+pub fn actor<T, U, S>(state: T, service: S) -> Actor<impl Future<Output = ()> + Send + 'static, U>
 where
     S: Send + 'static + for<'a> SendService<Context<'a, T, U>>,
     U: Send + 'static + for<'a> IntoContext<'a, T>,
@@ -74,27 +130,32 @@ where
 
             let cx = u.into_context(&mut t);
 
-            let Ok(svc) = svc.ready().await else { unreachable!()};
+            let Ok(svc) = svc.ready().await else { break };
 
             let _ = svc.call(cx).await;
         }
     }
 
-    let pid = crate::task::spawn(actor_impl(state, rx, service), TaskKind::Worker);
+    #[cfg(feature = "backtrace")]
+    let fut = async_backtrace::location!().frame(actor_impl(state, rx, service));
 
-    Address { pid, tx }
+    #[cfg(not(feature = "backtrace"))]
+    let fut = actor_impl(state, rx, service);
+
+    Actor { fut, tx }
 }
 
 #[cfg(test)]
 mod test {
-    async fn handle<'a>(r: super::Context<'a, (), ()>) -> Result<(), ()> {
+    async fn handle<'a>(_r: super::Context<'a, (), ()>) -> Result<(), ()> {
         Ok(())
     }
 
     #[tokio::test]
     async fn test() {
-        let mut svc = tower::service_fn(handle);
+        let svc = tower::service_fn(handle);
+        let act = super::actor((), svc);
 
-        // let act = super::actor((), svc);
+        crate::task::spawn(act, crate::task::TaskKind::Worker);
     }
 }

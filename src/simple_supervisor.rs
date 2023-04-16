@@ -51,6 +51,7 @@ pub(crate) async fn timeout_pids<T: std::fmt::Debug>(
 pub struct SupervisorStat {
     pub(crate) state: SupvervisorState,
 }
+
 impl SupervisorStat {
     pub(crate) fn new() -> SupervisorStat {
         Self {
@@ -75,11 +76,11 @@ pub(crate) enum SimpleSupervisorMessage {
 }
 
 pub(crate) struct SimpleSupervisorImpl<F> {
-    pub stat: watch::Sender<SupervisorStat>,
-    pub make_fut: F,
-    pub config: SupervisorConfig,
-    pub chan_rx: mpsc::Receiver<SimpleSupervisorMessage>,
-    pub suspend_signal: SupervisorSignal,
+    stat: watch::Sender<SupervisorStat>,
+    make_fut: F,
+    config: SupervisorConfig,
+    chan_rx: mpsc::Receiver<SimpleSupervisorMessage>,
+    suspend_signal: SupervisorSignal,
     shutdown_notify: Arc<Notify>,
     running: FuturesUnordered<crate::task::Pid<()>>,
 }

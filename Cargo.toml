@@ -4,8 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+async-backtrace = { version = "0.2.4", optional = true }
 futures = "0.3.27"
 pin-project = "1.0.12"
+tower = { version = "0.4.13", features = ["full", "tokio", "util"] }
+tracing = "0.1.37"
 tokio = { version = "1.26.0", features = [
     "sync",
     "rt",
@@ -13,9 +16,8 @@ tokio = { version = "1.26.0", features = [
     "rt-multi-thread",
     "time",
     "parking_lot",
+    "signal",
 ] }
-tower = { version = "0.4.13", features = ["full", "tokio", "util"] }
-tracing = "0.1.37"
 
 [dev-dependencies]
 tower = "0.4.13"
@@ -23,3 +25,4 @@ tracing-subscriber = "0.3.16"
 
 [features]
 default = []
+backtrace = ["async-backtrace"]

@@ -7,12 +7,11 @@ pub use graceful_shutdown::graceful_shutdown;
 mod group;
 pub use group::{Group, GroupBuilder};
 
+mod simple_supervisor;
 mod task;
 
-mod simple_supervisor;
-
 mod actor;
-pub use actor::{actor, Address, Context, IntoContext, SendService};
+pub use actor::{actor, Context, IntoContext, SendService};
 
 mod supervisor;
 pub use supervisor::{supervisor, Supervisor, SupervisorStrategy};

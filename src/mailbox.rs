@@ -4,20 +4,20 @@ use std::ops::Deref;
 use tokio::sync::oneshot;
 
 struct Mailbox<T> {
-    queue: VecDeque<T>,
-    pending: VecDeque<oneshot::Sender<T>>,
+    message_queue: VecDeque<T>,
+    pending_readers: VecDeque<oneshot::Sender<T>>,
 }
 
 impl<T> Mailbox<T> {
     fn push(&mut self, mut t: T) {
         loop {
-            match self.pending.pop_front() {
+            match self.pending_readers.pop_front() {
                 Some(tx) => match tx.send(t) {
                     Ok(()) => break,
                     Err(t2) => t = t2,
                 },
                 None => {
-                    self.queue.push_back(t);
+                    self.message_queue.push_back(t);
                     break;
                 }
             }
@@ -25,12 +25,12 @@ impl<T> Mailbox<T> {
     }
 
     fn pop(&mut self, tx: oneshot::Sender<T>) {
-        match self.queue.pop_front() {
+        match self.message_queue.pop_front() {
             Some(t) => match tx.send(t) {
                 Ok(()) => (),
-                Err(t) => self.queue.push_front(t),
+                Err(t) => self.message_queue.push_front(t),
             },
-            None => self.pending.push_back(tx),
+            None => self.pending_readers.push_back(tx),
         }
     }
 }
@@ -77,6 +77,7 @@ impl<T> MailboxChannel<T> {
     }
 }
 
+/// Used to send/push messages to the mailbox.
 #[derive(Debug)]
 #[repr(transparent)]
 pub struct MailboxSender<T>(MailboxChannel<T>);
@@ -88,11 +89,15 @@ impl<T> Clone for MailboxSender<T> {
 }
 
 impl<T> MailboxSender<T> {
+    /// Push a message to the queue allowing [`MailboxReceiver`]s to receive it.
+    #[inline]
+    #[cfg_attr(feature = "backtrace", async_backtrace::framed)]
     pub async fn send(&self, message: T) {
         self.0.push(message).await
     }
 }
 
+/// Used to receive/pop messages from the mailbox.
 #[derive(Debug)]
 pub struct MailboxReceiver<T>(MailboxChannel<T>);
 
@@ -103,7 +108,9 @@ impl<T> Clone for MailboxReceiver<T> {
 }
 
 impl<T> MailboxReceiver<T> {
+    /// Receive a message from the queue
     #[inline]
+    #[cfg_attr(feature = "backtrace", async_backtrace::framed)]
     pub async fn recv(&self) -> T {
         self.0.pop().await
     }
@@ -168,8 +175,8 @@ pub fn mailbox<T: Send + 'static>(capacity: usize) -> (MailboxSender<T>, Mailbox
     let channel = MailboxChannel(tx);
 
     let mbox = Mailbox {
-        queue: VecDeque::with_capacity(capacity),
-        pending: VecDeque::new(),
+        message_queue: VecDeque::with_capacity(capacity),
+        pending_readers: VecDeque::new(),
     };
 
     tokio::spawn(async move {

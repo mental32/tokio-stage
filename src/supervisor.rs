@@ -120,7 +120,6 @@ async fn supervisor_impl<F, Fut>(
 
     #[derive(Debug)]
     enum Select {
-        Shutdown,
         TaskExit(Option<crate::task::TaskId>),
         Message(SupervisorMessage),
         Inner(crate::simple_supervisor::Select),
@@ -149,10 +148,6 @@ async fn supervisor_impl<F, Fut>(
             Select::Inner(sel) => {
                 sv.poll(sel).await;
                 continue;
-            }
-            Select::Shutdown => {
-                sv_impl.shutdown_children(Duration::from_secs(1)).await;
-                return;
             }
             Select::TaskExit(None) => continue,
             Select::TaskExit(Some(task_id)) => {
@@ -344,6 +339,7 @@ async fn supervisor_impl<F, Fut>(
     }
 }
 
+/// An owned handle to the underlying supervisor
 #[derive(Debug)]
 pub struct Supervisor {
     sv_tx: MailboxSender<SupervisorMessage>,
@@ -351,6 +347,7 @@ pub struct Supervisor {
 }
 
 impl Supervisor {
+    /// send a child to be managed by this supervisor.
     pub async fn add_child<T>(&self, child: T) -> ChildRef
     where
         T: Into<Child>,
@@ -363,6 +360,7 @@ impl Supervisor {
         rx.await.expect("could not add supervisor child")
     }
 
+    /// terminate a child that is currently being supervised
     pub async fn terminate_child(&self, child_ref: ChildRef) -> Result<(), ()> {
         let (tx, rx) = oneshot::channel();
         self.sv_tx
@@ -373,13 +371,20 @@ impl Supervisor {
     }
 }
 
+/// Supervisor strategies dictate how the supervisor restarts worker tasks
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SupervisorStrategy {
+    /// If a child process terminates, only that process is restarted.
     OneForOne,
+    /// If a child process terminates, all other child processes are terminated, and then all child processes, including the terminated one, are restarted.
     OneForAll,
+    /// If a child process terminates, the rest of the child processes are terminated.
+    ///
+    /// Then the terminated child process and the rest of the child processes are restarted.
     RestForAll,
 }
 
+/// create and spawn a supervisor with the specified strategy.
 pub fn supervisor(strategy: SupervisorStrategy) -> Supervisor {
     let (tx, rx) = crate::mailbox(1);
     let inner = crate::group()

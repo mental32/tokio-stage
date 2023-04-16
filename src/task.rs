@@ -61,7 +61,7 @@ impl<T> Future for Pid<T> {
 }
 
 #[track_caller]
-pub fn spawn<T>(future: T, kind: TaskKind) -> Pid<T::Output>
+pub(crate) fn spawn<T>(future: T, kind: TaskKind) -> Pid<T::Output>
 where
     T: Future + Send + 'static,
     T::Output: Send + 'static,

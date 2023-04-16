@@ -21,8 +21,10 @@
         - [Code snippet 2.2](#code-snippet-22)
         - [Supervision Trees](#supervision-trees)
         - [Code snippet 2.3](#code-snippet-23)
+        - [Conclusion](#conclusion-1)
       - [Stage: The Third Degree](#stage-the-third-degree)
-  - [bottom of the page](#bottom-of-the-page)
+        - ["What is bastion?"](#what-is-bastion)
+        - [Conclusion](#conclusion-2)
 
 ## Brief
 
@@ -474,9 +476,27 @@ monitored and restarted depending on the chosen supervisor strategy. In this
 example, the two supervisors (sv1 and sv2) apply different restart strategies
 for their respective child nodes.
 
+##### Conclusion
+
+In this section, we explored Stage's second degree, which focuses on
+synchronization primitives, reliable channels, and building supervision trees.
+
+We first explored the concept of a mailbox and how it can be used to send
+messages without the need for serialization and deserialization, followed
+by the implementation of a graceful shutdown feature in Stage that ensures an
+orderly and controlled shutdown of a system or application. Finally, we learned
+about supervision trees and how they provide a fault-tolerant structure,
+allowing tasks to be monitored and restarted depending on the chosen supervisor
+strategy.
+
 #### Stage: The Third Degree
 
-## bottom of the page
+The third and final degree of stage resembles the usage of a regular actor
+framework specifically an bastion-esque actix.
+
+##### "What is bastion?"
+
+##### Conclusion
 
 [bastion]: https://docs.rs/bastion/latest/bastion/
 [ractor]: https://github.com/slawlor/ractor

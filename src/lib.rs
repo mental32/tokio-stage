@@ -8,10 +8,21 @@ mod group;
 pub use group::{Group, GroupBuilder};
 
 mod simple_supervisor;
+
+mod signal;
+
 mod task;
+pub use task::Pid;
+
+cfg_if::cfg_if! {
+    if #[cfg(feature = "stage3")] {
+        mod runtime;
+        pub use runtime::Runtime;
+    }
+}
 
 mod actor;
-pub use actor::{actor, Context, IntoContext, SendService};
+pub use actor::{actor, Actor, Context, IntoContext, SendService};
 
 mod supervisor;
 pub use supervisor::{supervisor, Supervisor, SupervisorStrategy};
@@ -63,7 +74,7 @@ pub fn group() -> group::GroupBuilder {
 /// ```
 /// # #[tokio::main]
 /// # async fn example() {
-/// let pid = stage::spawn(|| async { println!("hi"); });
+/// let pid = tokio_stage::spawn(|| async { println!("hi"); });
 /// pid.abort();
 /// # }
 /// ```
@@ -75,4 +86,13 @@ where
     Fut: Send + std::future::Future<Output = ()> + 'static,
 {
     group().spawn_at_least(1).spawn(f).inner.into()
+}
+
+/// Create a top-level runtime system to easily compose a supervision tree
+///
+#[cfg(feature = "stage3")]
+#[inline]
+#[track_caller]
+pub fn runtime() -> Runtime {
+    Runtime::new()
 }

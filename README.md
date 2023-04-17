@@ -23,7 +23,7 @@
         - [Code snippet 2.3](#code-snippet-23)
         - [Conclusion](#conclusion-1)
       - [Stage: The Third Degree](#stage-the-third-degree)
-        - ["What is bastion?"](#what-is-bastion)
+        - [Cluster support](#cluster-support)
         - [Conclusion](#conclusion-2)
 
 ## Brief
@@ -173,7 +173,7 @@ async fn main() {
     //    `F: Fn() -> Fut + Clone` and `Fut: Future<Output = ()> + 'static + Send` this constructor
     //    function is the core of what allows tasks to be restartable. first the future itself must
     //    be recreatable!
-    let group = stage::group()
+    let group = tokio_stage::group()
         .spawn(move || {
             let rx = Arc::clone(&rx);
             async move {
@@ -306,9 +306,9 @@ enum Message {
 async fn main() {
     // Deleted: let (tx, rx) = tokio::sync::mpsc::channel(1);
     // Deleted: let rx = Arc::new(Mutex::new(rx));
-    let (tx, rx) = stage::mailbox(1); // New!
+    let (tx, rx) = tokio_stage::mailbox(1); // New!
 
-    let group = stage::group()
+    let group = tokio_stage::group()
         .spawn(move || {
             // Deleted: let rx = Arc::clone(&rx);
             let rx = rx.clone();
@@ -378,7 +378,7 @@ fn task_a(tx: tokio::sync::mpsc::Sender<usize>) -> impl Future<Output = ()> {
     //    function. This future wraps the worker_fut and specifies a shutdown behavior
     //    using a closure. In this case, the shutdown behavior sends the value 2 over
     //    the channel when the shutdown is triggered.
-    let shutdown_fut = stage::graceful_shutdown(worker_fut, move |_worker_fut_pin| {
+    let shutdown_fut = tokio_stage::graceful_shutdown(worker_fut, move |_worker_fut_pin| {
         async move {
             tx_2.send(2).await;
         }
@@ -398,7 +398,7 @@ async fn main() {
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
     // 6. A task group is created using the stage::group function and spawns
     //    the task_a with a clone of the sender part of the channel.
-    let group = stage::group()
+    let group = tokio_stage::group()
         .spawn(move || task_a(tx.clone()));
 
     // 7. The group.scope function is called with an async block that awaits the 
@@ -434,15 +434,15 @@ async fn task_a() {
     std::future::pending().await
 }
 
-fn group_task_a() -> stage::Group {
-    stage::group().spawn(task_a)
+fn group_task_a() -> tokio_stage::Group {
+    tokio_stage::group().spawn(task_a)
 }
 
 #[tokio::main]
 async fn main() {
-    let sv1 = stage::supervisor(stage::SupervisorStrategy::OneForOne);
+    let sv1 = tokio_stage::supervisor(tokio_stage::SupervisorStrategy::OneForOne);
     let child1 = sv1.add_child(group_task_a()).await;
-    let sv2 = stage::supervisor(stage::SupervisorStrategy::OneForAll);
+    let sv2 = tokio_stage::supervisor(tokio_stage::SupervisorStrategy::OneForAll);
     let child2 = sv2.add_child(group_task_a()).await;
     let child3 = sv1.add_child(sv2).await;
 }
@@ -491,10 +491,11 @@ strategy.
 
 #### Stage: The Third Degree
 
-The third and final degree of stage resembles the usage of a regular actor
-framework specifically an bastion-esque actix.
+The third and final degree of stage is to use it as a top-level runtime
+that allows dynamic configuration and introspection of the underlying actor
+and tasks in the supervision tree.
 
-##### "What is bastion?"
+##### Cluster support
 
 ##### Conclusion
 

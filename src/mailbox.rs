@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::ops::Deref;
 
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 struct Mailbox<T> {
     message_queue: VecDeque<T>,
@@ -36,17 +36,17 @@ impl<T> Mailbox<T> {
 }
 
 #[derive(Debug)]
-enum Message<T> {
+pub(crate) enum Message<T> {
     Push(T),
-    Pop(tokio::sync::oneshot::Sender<T>),
+    Pop(oneshot::Sender<T>),
 }
 
 #[derive(Debug)]
 #[repr(transparent)]
-struct MailboxChannel<T>(tokio::sync::mpsc::Sender<Message<T>>);
+struct MailboxChannel<T>(mpsc::Sender<Message<T>>);
 
 impl<T> Deref for MailboxChannel<T> {
-    type Target = tokio::sync::mpsc::Sender<Message<T>>;
+    type Target = mpsc::Sender<Message<T>>;
 
     fn deref(&self) -> &Self::Target {
         &self.0
@@ -61,7 +61,7 @@ impl<T> Clone for MailboxChannel<T> {
 
 impl<T> MailboxChannel<T> {
     async fn pop(&self) -> T {
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = oneshot::channel();
 
         match self.deref().send(Message::Pop(tx)).await {
             Ok(()) => rx.await.expect("mailbox actor has dropped channel"),
@@ -89,6 +89,14 @@ impl<T> Clone for MailboxSender<T> {
 }
 
 impl<T> MailboxSender<T> {
+    pub(crate) fn into_raw(self) -> mpsc::Sender<Message<T>> {
+        self.0 .0
+    }
+
+    pub(crate) fn from_raw(tx: mpsc::Sender<Message<T>>) -> Self {
+        Self(MailboxChannel(tx))
+    }
+
     /// Push a message to the queue allowing [`MailboxReceiver`]s to receive it.
     #[inline]
     #[cfg_attr(feature = "backtrace", async_backtrace::framed)]
@@ -130,12 +138,12 @@ impl<T> MailboxReceiver<T> {
 /// struct State {
 ///     counter: AtomicUsize,
 ///     barrier: Barrier,
-///     rx: stage::MailboxReceiver<()>
+///     rx: tokio_stage::MailboxReceiver<()>
 /// }
 ///
 /// #[tokio::main]
 /// async fn main() {
-///     let (tx, rx) = stage::mailbox(512);
+///     let (tx, rx) = tokio_stage::mailbox(512);
 ///     let state = State {
 ///         counter: AtomicUsize::new(0),
 ///         barrier: Barrier::new(2),
@@ -144,7 +152,7 @@ impl<T> MailboxReceiver<T> {
 ///
 ///     let state = Arc::new(state);
 ///     let state2 = Arc::clone(&state);
-///     let group = stage::group()
+///     let group = tokio_stage::group()
 ///          .spawn(move || {
 ///          let state = Arc::clone(&state2);
 ///          async move {
@@ -171,7 +179,7 @@ impl<T> MailboxReceiver<T> {
 #[inline]
 #[track_caller]
 pub fn mailbox<T: Send + 'static>(capacity: usize) -> (MailboxSender<T>, MailboxReceiver<T>) {
-    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let (tx, mut rx) = mpsc::channel(capacity);
     let channel = MailboxChannel(tx);
 
     let mbox = Mailbox {
@@ -179,16 +187,19 @@ pub fn mailbox<T: Send + 'static>(capacity: usize) -> (MailboxSender<T>, Mailbox
         pending_readers: VecDeque::new(),
     };
 
-    tokio::spawn(async move {
-        let mut mbox = mbox;
+    crate::task::spawn(
+        async move {
+            let mut mbox = mbox;
 
-        while let Some(m) = rx.recv().await {
-            match m {
-                Message::Push(t) => mbox.push(t),
-                Message::Pop(tx) => mbox.pop(tx),
+            while let Some(m) = rx.recv().await {
+                match m {
+                    Message::Push(t) => mbox.push(t),
+                    Message::Pop(tx) => mbox.pop(tx),
+                }
             }
-        }
-    });
+        },
+        crate::task::TaskKind::Worker,
+    );
 
     (MailboxSender(channel.clone()), MailboxReceiver(channel))
 }

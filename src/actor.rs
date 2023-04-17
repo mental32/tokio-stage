@@ -1,6 +1,7 @@
 use std::future::Future;
 
 use futures::FutureExt;
+use tokio::sync::mpsc;
 use tower::ServiceExt;
 
 use crate::MailboxSender;
@@ -64,11 +65,22 @@ where
     type SendFuture = S::Future;
 }
 
+/// wrapper type for the underlying actor future that stores a copy of the channel [`Self::sender`].
 #[pin_project::pin_project]
 pub struct Actor<Fut, U> {
     #[pin]
     fut: Fut,
-    tx: MailboxSender<U>,
+    chan: mpsc::WeakSender<crate::mailbox::Message<U>>,
+}
+
+impl<Fut, U> Actor<Fut, U> {
+    /// Acquire a sender to this actors mailbox.
+    ///
+    /// `None` will be returned if it has been closed.
+    #[track_caller]
+    pub fn sender(&self) -> Option<MailboxSender<U>> {
+        self.chan.upgrade().map(MailboxSender::from_raw)
+    }
 }
 
 impl<Fut, U> Future for Actor<Fut, U>
@@ -94,7 +106,7 @@ where
 /// # Example
 ///
 /// ```
-/// use stage::Context;
+/// use tokio_stage::Context;
 ///
 /// async fn handle<'a>(_r: Context<'a, (), ()>) -> Result<(), ()> {
 ///     Ok(())
@@ -102,9 +114,9 @@ where
 ///
 /// #[tokio::main]
 /// async fn main() {
-///     let group = stage::group().spawn(|| {
+///     let group = tokio_stage::group().spawn(|| {
 ///         let svc = tower::service_fn(handle);
-///         stage::actor((), svc)
+///         tokio_stage::actor((), svc)
 ///     });
 ///     
 ///     group.scope(tokio::time::sleep(std::time::Duration::from_millis(10))).await;
@@ -142,7 +154,10 @@ where
     #[cfg(not(feature = "backtrace"))]
     let fut = actor_impl(state, rx, service);
 
-    Actor { fut, tx }
+    Actor {
+        fut,
+        chan: tx.into_raw().downgrade(),
+    }
 }
 
 #[cfg(test)]

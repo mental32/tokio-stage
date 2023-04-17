@@ -1,5 +1,5 @@
 [package]
-name = "stage"
+name = "tokio-stage"
 version = "0.1.0"
 edition = "2021"
 
@@ -18,6 +18,8 @@ tokio = { version = "1.26.0", features = [
     "parking_lot",
     "signal",
 ] }
+tonic = "0.9.1"
+cfg-if = "1.0.0"
 
 [dev-dependencies]
 tower = "0.4.13"
@@ -26,3 +28,4 @@ tracing-subscriber = "0.3.16"
 [features]
 default = []
 backtrace = ["async-backtrace"]
+stage3 = []

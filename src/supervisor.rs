@@ -1,20 +1,29 @@
-use std::ops::Deref;
+use std::future::Future;
+use std::ops::{ControlFlow, Deref};
 use std::time::Duration;
 
+use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
-use futures::{FutureExt, StreamExt};
+use futures::{FutureExt, Stream, StreamExt};
 
 use tokio::sync::oneshot;
 use tracing::Instrument;
 
-use crate::group::{MakePendingFut, RestartPolicy};
+use crate::group::{GroupRef, MakePendingFut, RestartPolicy};
 use crate::simple_supervisor::{SimpleSupervisorImpl, SimpleSupervisorMessage};
-use crate::task::{TaskId, TaskKind};
+use crate::task::{TaskIdRepr, TaskKind};
 use crate::{Group, MailboxReceiver, MailboxSender};
+
+#[derive(Debug)]
+enum Select {
+    TaskExit(Option<crate::task::TaskIdRepr>),
+    Message(SupervisorMessage),
+    Inner(crate::simple_supervisor::Select),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(transparent)]
-pub struct ChildRef(crate::task::TaskId);
+pub struct ChildRef(crate::task::TaskIdRepr);
 
 #[derive(Debug)]
 enum SupervisorMessage {
@@ -72,15 +81,262 @@ impl Default for ChildState {
 }
 
 struct SupervisedChild {
-    task_id: crate::task::TaskId,
+    task_id: crate::task::TaskIdRepr,
     slot: ChildState,
 }
 
-struct SupervisorImpl {
+struct SupervisorImpl<F> {
+    inner: SimpleSupervisorImpl<F>,
     children: Vec<SupervisedChild>,
+    strategy: SupervisorStrategy,
+    rx: MailboxReceiver<SupervisorMessage>,
 }
 
-impl SupervisorImpl {
+fn map_to_task_id<T>(task_id: TaskIdRepr) -> impl FnOnce(T) -> TaskIdRepr {
+    move |_: T| -> TaskIdRepr { task_id }
+}
+
+trait SupervisorFutures: Stream<Item = TaskIdRepr> + Send + Unpin {
+    fn is_empty(&self) -> bool;
+    fn clear(&mut self);
+    fn push_group_ref(&self, group_ref: GroupRef);
+}
+
+impl SupervisorFutures for FuturesUnordered<BoxFuture<'static, TaskIdRepr>> {
+    #[inline]
+    fn is_empty(&self) -> bool {
+        FuturesUnordered::is_empty(&self)
+    }
+
+    #[inline]
+    fn clear(&mut self) {
+        FuturesUnordered::clear(self)
+    }
+
+    #[inline]
+    fn push_group_ref(&self, group_ref: GroupRef) {
+        self.push(
+            group_ref
+                .wait_until_suspended()
+                .map(map_to_task_id(group_ref.task_id()))
+                .boxed(),
+        )
+    }
+}
+
+impl<F, Fut> SupervisorImpl<F>
+where
+    F: 'static + Clone + Send + Fn() -> Fut,
+    Fut: 'static + Send + Future<Output = ()>,
+    Fut::Output: 'static + Send,
+{
+    #[inline]
+    #[track_caller]
+    fn handle_task_exit(&mut self, task_id: TaskIdRepr, futs: &mut dyn SupervisorFutures) {
+        let (ix, child, task_id) = match self
+            .children
+            .iter()
+            .enumerate()
+            .find(|ch| ch.1.task_id == task_id)
+        {
+            Some((
+                ix,
+                SupervisedChild {
+                    task_id,
+                    slot: ChildState::Active(child),
+                },
+            )) => (ix, child, *task_id),
+            _ => return,
+        };
+
+        let span = tracing::trace_span!("task-exit", task_id, index = ?ix);
+        let _guard = span.enter();
+
+        tracing::trace!("task exit");
+
+        match self.strategy {
+            SupervisorStrategy::OneForOne => {
+                let resume_result = child.resume();
+                tracing::trace!(?resume_result, "resuming task");
+
+                match resume_result {
+                    Ok(()) => {
+                        tracing::trace!("registering group-ref to observe task");
+                        futs.push_group_ref(child.to_group_ref());
+                    }
+                    Err(()) => {
+                        tracing::trace!("child has died abnormally. marking as deleted.");
+                        std::mem::drop(child);
+                        std::mem::take(&mut self.children[ix].slot);
+                    }
+                }
+            }
+            SupervisorStrategy::OneForAll => {
+                futs.clear();
+
+                for child in self.children.iter_mut().rev() {
+                    let filter = if let ChildState::Active(child) = &child.slot {
+                        child.suspend().is_err()
+                    } else {
+                        false
+                    };
+
+                    if filter {
+                        child.slot = ChildState::Deleted;
+                    }
+                }
+
+                for child in self.children.iter_mut() {
+                    let filter = if let ChildState::Active(child) = &child.slot {
+                        child.resume().is_err()
+                    } else {
+                        false
+                    };
+
+                    if filter {
+                        child.slot = ChildState::Deleted;
+                    }
+                }
+
+                for child in self.children.iter() {
+                    if let ChildState::Active(child) = &child.slot {
+                        futs.push_group_ref(child.to_group_ref());
+                    }
+                }
+            }
+            SupervisorStrategy::RestForAll => {
+                futs.clear();
+
+                let (lhs, rhs) = self.children.split_at_mut(ix);
+
+                for child in rhs.iter_mut().skip(1).rev() {
+                    let filter = if let ChildState::Active(child) = &child.slot {
+                        child.suspend().is_err()
+                    } else {
+                        false
+                    };
+
+                    if filter {
+                        child.slot = ChildState::Deleted;
+                    }
+                }
+
+                for child in rhs.iter_mut() {
+                    let filter = if let ChildState::Active(child) = &child.slot {
+                        child.resume().is_err()
+                    } else {
+                        false
+                    };
+
+                    if filter {
+                        child.slot = ChildState::Deleted;
+                    }
+                }
+
+                for child in lhs.into_iter().chain(rhs.into_iter()) {
+                    if let ChildState::Active(child) = &child.slot {
+                        futs.push_group_ref(child.to_group_ref());
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg_attr(feature = "backtrace", async_backtrace::framed)]
+    async fn select(&mut self, futs: &mut dyn SupervisorFutures) -> Select {
+        tokio::select! {
+            sel = self.inner.select() => { Select::Inner(sel) }
+            fut = futs.next(), if !futs.is_empty() => Select::TaskExit(fut),
+            msg = self.rx.recv() => Select::Message(msg),
+        }
+    }
+
+    #[cfg_attr(feature = "backtrace", async_backtrace::framed)]
+    async fn handle_select(
+        &mut self,
+        sel: Select,
+        futs: &mut dyn SupervisorFutures,
+    ) -> ControlFlow<()> {
+        match sel {
+            Select::Inner(crate::simple_supervisor::Select::Message(
+                SimpleSupervisorMessage::Exit { timeout },
+            )) => {
+                self.shutdown_children(timeout).await;
+                ControlFlow::Break(())
+            }
+            Select::Inner(sel) => {
+                self.inner.poll(sel).await;
+                ControlFlow::Continue(())
+            }
+            Select::TaskExit(None) => ControlFlow::Continue(()),
+            Select::TaskExit(Some(task_id)) => {
+                self.handle_task_exit(task_id, futs);
+                ControlFlow::Continue(())
+            }
+            Select::Message(m) => {
+                self.handle_supervisor_message(m, futs).await;
+                ControlFlow::Continue(())
+            }
+        }
+    }
+
+    #[cfg_attr(feature = "backtrace", async_backtrace::framed)]
+    async fn handle_supervisor_message(
+        &mut self,
+        message: SupervisorMessage,
+        futs: &mut dyn SupervisorFutures,
+    ) {
+        match message {
+            SupervisorMessage::TerminateChild(child_ref, tx) => {
+                let span = tracing::trace_span!("terminate-child", task_id = child_ref.0);
+                let _guard = span.enter();
+
+                let _ = match self
+                    .children
+                    .iter()
+                    .position(|child| child.task_id == child_ref.0)
+                {
+                    None => tx.send(Err(())),
+                    Some(ix) => {
+                        tracing::trace!("terminating child by reference");
+
+                        let child = self.children.get_mut(ix).unwrap();
+
+                        let slot = std::mem::take(&mut child.slot);
+
+                        match slot {
+                            ChildState::Deleted => tx.send(Ok(())),
+                            ChildState::Active(group) => {
+                                let _ = group.exit(Duration::from_secs(1)).await;
+                                tx.send(Ok(()))
+                            }
+                        }
+                    }
+                };
+            }
+            SupervisorMessage::AddChild(group, tx) => {
+                let task_id = group.task_id();
+
+                let span = tracing::trace_span!("add-child", task_id);
+                let _guard = span.enter();
+
+                tracing::trace!("adding child to managed set");
+
+                futs.push_group_ref(group.to_group_ref());
+
+                self.children.push(SupervisedChild {
+                    task_id,
+                    slot: ChildState::Active(group),
+                });
+
+                // we dont care if the other side died
+                // since we're now managing the child.
+                let _ = tx.send(ChildRef(task_id));
+            }
+        }
+    }
+
+    #[cfg_attr(feature = "backtrace", async_backtrace::framed)]
     async fn shutdown_children(&mut self, timeout: Duration) {
         let mut futs = FuturesUnordered::new();
 
@@ -106,8 +362,9 @@ impl SupervisorImpl {
     }
 }
 
+#[cfg_attr(feature = "backtrace", async_backtrace::framed)]
 async fn supervisor_impl<F, Fut>(
-    mut sv: SimpleSupervisorImpl<F>,
+    sv: SimpleSupervisorImpl<F>,
     rx: MailboxReceiver<SupervisorMessage>,
     strategy: SupervisorStrategy,
 ) where
@@ -115,227 +372,22 @@ async fn supervisor_impl<F, Fut>(
     Fut: 'static + Send + std::future::Future<Output = ()>,
     Fut::Output: 'static + Send,
 {
-    let mut sv_impl = SupervisorImpl { children: vec![] };
+    let mut sv_impl = SupervisorImpl {
+        rx,
+        inner: sv,
+        strategy,
+        children: vec![],
+    };
+
     let mut futs = FuturesUnordered::new();
 
-    #[derive(Debug)]
-    enum Select {
-        TaskExit(Option<crate::task::TaskId>),
-        Message(SupervisorMessage),
-        Inner(crate::simple_supervisor::Select),
-    }
-
-    fn map_to_task_id<T>(task_id: TaskId) -> impl FnOnce(T) -> TaskId {
-        move |_: T| -> TaskId { task_id }
-    }
-
-    // let notify = crate::graceful_shutdown::SHUTDOWN_NOTIFY.try_with(|n| Arc::clone(&n));
-
     loop {
-        let sel = tokio::select! {
-            sel = sv.select() => { Select::Inner(sel) }
-            fut = futs.next(), if !futs.is_empty() => Select::TaskExit(fut),
-            msg = rx.recv() => Select::Message(msg),
+        let sel = sv_impl.select(&mut futs).await;
+
+        match sv_impl.handle_select(sel, &mut futs).await {
+            ControlFlow::Continue(()) => continue,
+            ControlFlow::Break(()) => return,
         };
-
-        let m = match sel {
-            Select::Inner(crate::simple_supervisor::Select::Message(
-                SimpleSupervisorMessage::Exit { timeout },
-            )) => {
-                sv_impl.shutdown_children(timeout).await;
-                return;
-            }
-            Select::Inner(sel) => {
-                sv.poll(sel).await;
-                continue;
-            }
-            Select::TaskExit(None) => continue,
-            Select::TaskExit(Some(task_id)) => {
-                let (ix, child, task_id) = match sv_impl
-                    .children
-                    .iter()
-                    .enumerate()
-                    .find(|ch| ch.1.task_id == task_id)
-                {
-                    Some((
-                        ix,
-                        SupervisedChild {
-                            task_id,
-                            slot: ChildState::Active(child),
-                        },
-                    )) => (ix, child, *task_id),
-                    _ => continue,
-                };
-
-                let span = tracing::trace_span!("task-exit", task_id, index = ?ix);
-                let _guard = span.enter();
-
-                tracing::trace!("task exit");
-
-                match strategy {
-                    SupervisorStrategy::OneForOne => {
-                        let resume_result = child.resume();
-                        tracing::trace!(?resume_result, "resuming task");
-
-                        match resume_result {
-                            Ok(()) => {
-                                tracing::trace!("registering group-ref to observe task");
-                                futs.push(
-                                    child
-                                        .to_group_ref()
-                                        .wait_until_suspended()
-                                        .map(map_to_task_id(task_id)),
-                                );
-                            }
-                            Err(()) => {
-                                tracing::trace!("child has died abnormally. marking as deleted.");
-                                std::mem::drop(child);
-                                std::mem::take(&mut sv_impl.children[ix].slot);
-                                continue;
-                            }
-                        }
-
-                        continue;
-                    }
-                    SupervisorStrategy::OneForAll => {
-                        futs.clear();
-
-                        for child in sv_impl.children.iter_mut().rev() {
-                            let filter = if let ChildState::Active(child) = &child.slot {
-                                child.suspend().is_err()
-                            } else {
-                                false
-                            };
-
-                            if filter {
-                                child.slot = ChildState::Deleted;
-                            }
-                        }
-
-                        for child in sv_impl.children.iter_mut() {
-                            let filter = if let ChildState::Active(child) = &child.slot {
-                                child.resume().is_err()
-                            } else {
-                                false
-                            };
-
-                            if filter {
-                                child.slot = ChildState::Deleted;
-                            }
-                        }
-
-                        for child in sv_impl.children.iter() {
-                            if let ChildState::Active(child) = &child.slot {
-                                futs.push(
-                                    child
-                                        .to_group_ref()
-                                        .wait_until_suspended()
-                                        .map(map_to_task_id(task_id)),
-                                );
-                            }
-                        }
-
-                        continue;
-                    }
-                    SupervisorStrategy::RestForAll => {
-                        futs.clear();
-
-                        let (lhs, rhs) = sv_impl.children.split_at_mut(ix);
-
-                        for child in rhs.iter_mut().skip(1).rev() {
-                            let filter = if let ChildState::Active(child) = &child.slot {
-                                child.suspend().is_err()
-                            } else {
-                                false
-                            };
-
-                            if filter {
-                                child.slot = ChildState::Deleted;
-                            }
-                        }
-
-                        for child in rhs.iter_mut() {
-                            let filter = if let ChildState::Active(child) = &child.slot {
-                                child.resume().is_err()
-                            } else {
-                                false
-                            };
-
-                            if filter {
-                                child.slot = ChildState::Deleted;
-                            }
-                        }
-
-                        for child in lhs.into_iter().chain(rhs.into_iter()) {
-                            if let ChildState::Active(child) = &child.slot {
-                                futs.push(
-                                    child
-                                        .to_group_ref()
-                                        .wait_until_suspended()
-                                        .map(map_to_task_id(task_id)),
-                                );
-                            }
-                        }
-                        continue;
-                    }
-                }
-            }
-            Select::Message(m) => m,
-        };
-
-        match m {
-            SupervisorMessage::TerminateChild(child_ref, tx) => {
-                let span = tracing::trace_span!("terminate-child", task_id = child_ref.0);
-                let _guard = span.enter();
-
-                let _ = match sv_impl
-                    .children
-                    .iter()
-                    .position(|child| child.task_id == child_ref.0)
-                {
-                    None => tx.send(Err(())),
-                    Some(ix) => {
-                        tracing::trace!("terminating child by reference");
-
-                        let child = sv_impl.children.get_mut(ix).unwrap();
-
-                        let slot = std::mem::take(&mut child.slot);
-
-                        match slot {
-                            ChildState::Deleted => tx.send(Ok(())),
-                            ChildState::Active(group) => {
-                                let _ = group.exit(Duration::from_secs(1)).await;
-                                tx.send(Ok(()))
-                            }
-                        }
-                    }
-                };
-            }
-            SupervisorMessage::AddChild(group, tx) => {
-                let task_id = group.task_id();
-
-                let span = tracing::trace_span!("add-child", task_id);
-                let _guard = span.enter();
-
-                tracing::trace!("adding child to managed set");
-
-                futs.push(
-                    group
-                        .to_group_ref()
-                        .wait_until_suspended()
-                        .map(map_to_task_id(task_id)),
-                );
-
-                sv_impl.children.push(SupervisedChild {
-                    task_id,
-                    slot: ChildState::Active(group),
-                });
-
-                // we dont care if the other side died
-                // since we're now managing the child.
-                let _ = tx.send(ChildRef(task_id));
-            }
-        }
     }
 }
 
@@ -348,6 +400,7 @@ pub struct Supervisor {
 
 impl Supervisor {
     /// send a child to be managed by this supervisor.
+    #[cfg_attr(feature = "backtrace", async_backtrace::framed)]
     pub async fn add_child<T>(&self, child: T) -> ChildRef
     where
         T: Into<Child>,
@@ -361,6 +414,7 @@ impl Supervisor {
     }
 
     /// terminate a child that is currently being supervised
+    #[cfg_attr(feature = "backtrace", async_backtrace::framed)]
     pub async fn terminate_child(&self, child_ref: ChildRef) -> Result<(), ()> {
         let (tx, rx) = oneshot::channel();
         self.sv_tx
@@ -368,6 +422,15 @@ impl Supervisor {
             .await;
 
         rx.await.expect("could not add supervisor child")
+    }
+
+    /// signal to the supervisor to terminate its children recursively and then shutdown.
+    #[cfg_attr(feature = "backtrace", async_backtrace::framed)]
+    pub async fn exit(self, timeout: Duration) {
+        match self.sv_group.exit(timeout).await {
+            Ok(()) => (),
+            Err(_) => (),
+        }
     }
 }
 

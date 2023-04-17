@@ -87,7 +87,7 @@ pub(crate) struct SimpleSupervisorImpl<F> {
 
 #[derive(Debug)]
 pub(crate) enum Select {
-    Future(Option<Result<((), crate::task::TaskId), tokio::task::JoinError>>),
+    Future(Option<Result<((), crate::task::TaskIdRepr), tokio::task::JoinError>>),
     Message(SimpleSupervisorMessage),
     Suspend,
     Nop,
@@ -116,7 +116,11 @@ impl<F> SimpleSupervisorImpl<F> {
 
     async fn shutdown_children(&mut self, timeout: Duration) {
         self.shutdown_notify.notify_waiters();
-        timeout_pids(timeout, &mut self.running).await
+        timeout_pids(
+            Duration::from_millis(timeout.as_millis() as u64 + 100),
+            &mut self.running,
+        )
+        .await
     }
 
     pub(crate) async fn select(&mut self) -> Select {
@@ -187,7 +191,10 @@ where
         pid
     }
 
-    fn handle_task_exit(&mut self, res: Result<((), crate::task::TaskId), tokio::task::JoinError>) {
+    fn handle_task_exit(
+        &mut self,
+        res: Result<((), crate::task::TaskIdRepr), tokio::task::JoinError>,
+    ) {
         let task_id = res.as_ref().ok().map(|ab| ab.1);
         let span = tracing::trace_span!("task-exit", task_id = task_id);
         let _guard = span.enter();

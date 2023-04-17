@@ -12,7 +12,7 @@ use crate::simple_supervisor::{
     SimpleSupervisorImpl, SimpleSupervisorMessage, SupervisorSignalTx, SupervisorStat,
     SupvervisorState,
 };
-use crate::task::TaskKind;
+use crate::task::{TaskIdRepr, TaskKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestartPolicy {
@@ -212,7 +212,7 @@ impl Group {
             .map_err(|_| ())
     }
 
-    pub(crate) fn task_id(&self) -> crate::task::TaskId {
+    pub(crate) fn task_id(&self) -> crate::task::TaskIdRepr {
         self.inner.sv_handle.task_id
     }
 }
@@ -276,7 +276,7 @@ impl Group {
     /// Scope the lifetime of the supervisor to the future provided.
     ///
     /// When the future finishes the task group will be shutdown permanently.
-    /// See the documentation for [`Self::shutdown`] for more details.
+    /// See the documentation for [`Self::exit`] for more details.
     pub async fn scope<T, Fut>(self, future: Fut) -> T
     where
         Fut: Future<Output = T> + Send,
@@ -294,7 +294,7 @@ impl Group {
 
 #[derive(Debug, Clone)]
 pub struct GroupRef {
-    sv_task_id: crate::task::TaskId,
+    sv_task_id: crate::task::TaskIdRepr,
     sv_stat: watch::Receiver<SupervisorStat>,
 }
 
@@ -305,10 +305,14 @@ impl PartialEq for GroupRef {
 }
 
 impl GroupRef {
+    pub(crate) fn task_id(&self) -> TaskIdRepr {
+        self.sv_task_id
+    }
+
     pub(crate) fn wait_until(
         &self,
         state: SupvervisorState,
-    ) -> impl Future<Output = crate::task::TaskId> + 'static {
+    ) -> impl Future<Output = crate::task::TaskIdRepr> + 'static {
         let mut sv_stat = self.sv_stat.clone();
         let sv_task_id = self.sv_task_id;
 
@@ -327,7 +331,7 @@ impl GroupRef {
 
     pub(crate) fn wait_until_suspended(
         &self,
-    ) -> impl Future<Output = crate::task::TaskId> + 'static {
+    ) -> impl Future<Output = crate::task::TaskIdRepr> + 'static {
         self.wait_until(SupvervisorState::Suspend)
     }
 
